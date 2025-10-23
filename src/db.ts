@@ -84,6 +84,68 @@ export async function initDb(): Promise<void> {
       edgeNote TEXT,
       PRIMARY KEY (mapId, cidr)
     );
+    -- LAN data (normalized)
+    CREATE TABLE IF NOT EXISTS lan_switches (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      subnet TEXT NOT NULL,
+      name TEXT,
+      model TEXT,
+      mgmtIp TEXT,
+      location TEXT,
+      meta TEXT,
+      posX REAL,
+      posY REAL
+    );
+    CREATE TABLE IF NOT EXISTS lan_ports (
+      id TEXT PRIMARY KEY,
+      switchId TEXT NOT NULL,
+      name TEXT,
+      idx INTEGER,
+      poe INTEGER,
+      speed TEXT,
+      meta TEXT
+    );
+    CREATE TABLE IF NOT EXISTS lan_vlans (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      subnet TEXT NOT NULL,
+      vid INTEGER,
+      name TEXT,
+      meta TEXT
+    );
+    CREATE TABLE IF NOT EXISTS lan_port_vlans (
+      portId TEXT NOT NULL,
+      vlanId TEXT NOT NULL,
+      mode TEXT,
+      untagged INTEGER,
+      PRIMARY KEY (portId, vlanId)
+    );
+    CREATE TABLE IF NOT EXISTS lan_hosts (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      subnet TEXT NOT NULL,
+      ip TEXT,
+      mac TEXT,
+      name TEXT,
+      note TEXT,
+      source TEXT DEFAULT 'manual',
+      posX REAL,
+      posY REAL
+    );
+    CREATE TABLE IF NOT EXISTS lan_bindings (
+      hostId TEXT NOT NULL,
+      portId TEXT NOT NULL,
+      PRIMARY KEY (hostId, portId)
+    );
+    CREATE TABLE IF NOT EXISTS lan_notes (
+      mapId TEXT NOT NULL,
+      subnet TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      scopeId TEXT,
+      text TEXT,
+      PRIMARY KEY (mapId, subnet, scope, scopeId)
+    );
   `);
   try { db.exec('ALTER TABLE annotations2 ADD COLUMN offset REAL'); } catch {}
   try { db.exec('ALTER TABLE annotations2 ADD COLUMN edgeNote TEXT'); } catch {}
@@ -292,7 +354,31 @@ export async function renameFirstDeviceForMap(mapId: string, name: string): Prom
 export async function deleteMap(id: string): Promise<void> {
   const db = getDb();
   try {
-    let stmt = db.prepare('DELETE FROM annotations2 WHERE mapId = ?');
+    // Purge LAN data first
+    let stmt = db.prepare('DELETE FROM lan_notes WHERE mapId = ?');
+    stmt.run([id]);
+    stmt.free();
+    stmt = db.prepare('DELETE FROM lan_bindings WHERE hostId IN (SELECT id FROM lan_hosts WHERE mapId = ?)');
+    stmt.run([id]);
+    stmt.free();
+    stmt = db.prepare('DELETE FROM lan_port_vlans WHERE portId IN (SELECT id FROM lan_ports WHERE switchId IN (SELECT id FROM lan_switches WHERE mapId = ?))');
+    stmt.run([id]);
+    stmt.free();
+    stmt = db.prepare('DELETE FROM lan_ports WHERE switchId IN (SELECT id FROM lan_switches WHERE mapId = ?)');
+    stmt.run([id]);
+    stmt.free();
+    stmt = db.prepare('DELETE FROM lan_switches WHERE mapId = ?');
+    stmt.run([id]);
+    stmt.free();
+    stmt = db.prepare('DELETE FROM lan_vlans WHERE mapId = ?');
+    stmt.run([id]);
+    stmt.free();
+    stmt = db.prepare('DELETE FROM lan_hosts WHERE mapId = ?');
+    stmt.run([id]);
+    stmt.free();
+
+    // Then annotations and map records
+    stmt = db.prepare('DELETE FROM annotations2 WHERE mapId = ?');
     stmt.run([id]);
     stmt.free();
 
@@ -310,4 +396,190 @@ export async function deleteMap(id: string): Promise<void> {
   } finally {
     await persist();
   }
+}
+
+// ---------------- LAN: switches ----------------
+export type LanSwitch = { id: string; mapId: string; subnet: string; name?: string; model?: string; mgmtIp?: string; location?: string; meta?: string; posX?: number; posY?: number };
+export async function listLanSwitches(mapId: string, subnet: string): Promise<LanSwitch[]> {
+  const db = getDb();
+  const out: LanSwitch[] = [];
+  const stmt = db.prepare('SELECT id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY FROM lan_switches WHERE mapId = ? AND subnet = ? ORDER BY name');
+  stmt.bind([mapId, subnet]);
+  while (stmt.step()) {
+    const r = stmt.get();
+    out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, name: r[3] as string | undefined, model: r[4] as string | undefined, mgmtIp: r[5] as string | undefined, location: r[6] as string | undefined, meta: r[7] as string | undefined, posX: r[8] as number | undefined, posY: r[9] as number | undefined });
+  }
+  stmt.free();
+  return out;
+}
+export async function upsertLanSwitch(partial: Partial<LanSwitch> & { mapId: string; subnet: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || (uuid());
+  const stmt = db.prepare('INSERT INTO lan_switches (id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, model=excluded.model, mgmtIp=excluded.mgmtIp, location=excluded.location, meta=excluded.meta, posX=excluded.posX, posY=excluded.posY');
+  stmt.run([id, partial.mapId, partial.subnet, partial.name || null, partial.model || null, partial.mgmtIp || null, partial.location || null, partial.meta || null, partial.posX ?? null, partial.posY ?? null]);
+  stmt.free();
+  await touchMap(partial.mapId);
+  return id;
+}
+export async function deleteLanSwitch(mapId: string, switchId: string): Promise<void> {
+  const db = getDb();
+  let stmt = db.prepare('DELETE FROM lan_port_vlans WHERE portId IN (SELECT id FROM lan_ports WHERE switchId = ?)');
+  stmt.run([switchId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_bindings WHERE portId IN (SELECT id FROM lan_ports WHERE switchId = ?)');
+  stmt.run([switchId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_ports WHERE switchId = ?');
+  stmt.run([switchId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_switches WHERE id = ?');
+  stmt.run([switchId]); stmt.free();
+  await touchMap(mapId);
+}
+
+// ---------------- LAN: ports ----------------
+export type LanPort = { id: string; switchId: string; name?: string; idx?: number; poe?: boolean; speed?: string; meta?: string };
+export async function listLanPorts(switchId: string): Promise<LanPort[]> {
+  const db = getDb();
+  const out: LanPort[] = [];
+  const stmt = db.prepare('SELECT id, switchId, name, idx, poe, speed, meta FROM lan_ports WHERE switchId = ? ORDER BY COALESCE(idx, 0), name');
+  stmt.bind([switchId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, switchId: r[1] as string, name: r[2] as string | undefined, idx: r[3] as number | undefined, poe: !!r[4], speed: r[5] as string | undefined, meta: r[6] as string | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function upsertLanPort(partial: Partial<LanPort> & { switchId: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || (uuid());
+  const stmt = db.prepare('INSERT INTO lan_ports (id, switchId, name, idx, poe, speed, meta) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, idx=excluded.idx, poe=excluded.poe, speed=excluded.speed, meta=excluded.meta');
+  stmt.run([id, partial.switchId, partial.name || null, partial.idx ?? null, partial.poe ? 1 : 0, partial.speed || null, partial.meta || null]);
+  stmt.free();
+  return id;
+}
+export async function deleteLanPort(portId: string): Promise<void> {
+  const db = getDb();
+  let stmt = db.prepare('DELETE FROM lan_port_vlans WHERE portId = ?');
+  stmt.run([portId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_bindings WHERE portId = ?');
+  stmt.run([portId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_ports WHERE id = ?');
+  stmt.run([portId]); stmt.free();
+}
+
+// ---------------- LAN: VLANs ----------------
+export type LanVlan = { id: string; mapId: string; subnet: string; vid?: number; name?: string; meta?: string };
+export async function listLanVlans(mapId: string, subnet: string): Promise<LanVlan[]> {
+  const db = getDb();
+  const out: LanVlan[] = [];
+  const stmt = db.prepare('SELECT id, mapId, subnet, vid, name, meta FROM lan_vlans WHERE mapId = ? AND subnet = ? ORDER BY vid');
+  stmt.bind([mapId, subnet]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, vid: r[3] as number | undefined, name: r[4] as string | undefined, meta: r[5] as string | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function upsertLanVlan(partial: Partial<LanVlan> & { mapId: string; subnet: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || (uuid());
+  const stmt = db.prepare('INSERT INTO lan_vlans (id, mapId, subnet, vid, name, meta) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET vid=excluded.vid, name=excluded.name, meta=excluded.meta');
+  stmt.run([id, partial.mapId, partial.subnet, partial.vid ?? null, partial.name || null, partial.meta || null]);
+  stmt.free();
+  await touchMap(partial.mapId);
+  return id;
+}
+export async function deleteLanVlan(mapId: string, vlanId: string): Promise<void> {
+  const db = getDb();
+  let stmt = db.prepare('DELETE FROM lan_port_vlans WHERE vlanId = ?');
+  stmt.run([vlanId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_vlans WHERE id = ?');
+  stmt.run([vlanId]); stmt.free();
+  await touchMap(mapId);
+}
+export type LanPortVlan = { portId: string; vlanId: string; mode?: string; untagged?: boolean };
+export async function setPortVlanBinding(portId: string, vlanId: string, mode?: 'access'|'trunk'|'native', untagged?: boolean): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('INSERT INTO lan_port_vlans (portId, vlanId, mode, untagged) VALUES (?, ?, ?, ?) ON CONFLICT(portId, vlanId) DO UPDATE SET mode=excluded.mode, untagged=excluded.untagged');
+  stmt.run([portId, vlanId, mode || null, untagged ? 1 : 0]);
+  stmt.free();
+}
+export async function clearPortVlanBinding(portId: string, vlanId: string): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('DELETE FROM lan_port_vlans WHERE portId = ? AND vlanId = ?');
+  stmt.run([portId, vlanId]); stmt.free();
+}
+export async function getPortVlans(portId: string): Promise<LanPortVlan[]> {
+  const db = getDb();
+  const out: LanPortVlan[] = [];
+  const stmt = db.prepare('SELECT portId, vlanId, mode, untagged FROM lan_port_vlans WHERE portId = ?');
+  stmt.bind([portId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ portId: r[0] as string, vlanId: r[1] as string, mode: r[2] as string | undefined, untagged: !!r[3] }); }
+  stmt.free();
+  return out;
+}
+
+// ---------------- LAN: hosts ----------------
+export type LanHost = { id: string; mapId: string; subnet: string; ip?: string; mac?: string; name?: string; note?: string; source?: string; posX?: number; posY?: number };
+export async function listLanHosts(mapId: string, subnet: string): Promise<LanHost[]> {
+  const db = getDb();
+  const out: LanHost[] = [];
+  const stmt = db.prepare('SELECT id, mapId, subnet, ip, mac, name, note, source, posX, posY FROM lan_hosts WHERE mapId = ? AND subnet = ? ORDER BY ip');
+  stmt.bind([mapId, subnet]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, ip: r[3] as string | undefined, mac: r[4] as string | undefined, name: r[5] as string | undefined, note: r[6] as string | undefined, source: r[7] as string | undefined, posX: r[8] as number | undefined, posY: r[9] as number | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function upsertLanHost(partial: Partial<LanHost> & { mapId: string; subnet: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || (uuid());
+  const stmt = db.prepare('INSERT INTO lan_hosts (id, mapId, subnet, ip, mac, name, note, source, posX, posY) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ip=excluded.ip, mac=excluded.mac, name=excluded.name, note=excluded.note, source=excluded.source, posX=excluded.posX, posY=excluded.posY');
+  stmt.run([id, partial.mapId, partial.subnet, partial.ip || null, partial.mac || null, partial.name || null, partial.note || null, partial.source || 'manual', partial.posX ?? null, partial.posY ?? null]);
+  stmt.free();
+  await touchMap(partial.mapId);
+  return id;
+}
+export async function deleteLanHost(mapId: string, hostId: string): Promise<void> {
+  const db = getDb();
+  let stmt = db.prepare('DELETE FROM lan_bindings WHERE hostId = ?');
+  stmt.run([hostId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_notes WHERE scope = "host" AND scopeId = ?');
+  stmt.run([hostId]); stmt.free();
+  stmt = db.prepare('DELETE FROM lan_hosts WHERE id = ?');
+  stmt.run([hostId]); stmt.free();
+  await touchMap(mapId);
+}
+export type LanBinding = { hostId: string; portId: string };
+export async function bindHostToPort(hostId: string, portId: string): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('INSERT OR IGNORE INTO lan_bindings (hostId, portId) VALUES (?, ?)');
+  stmt.run([hostId, portId]); stmt.free();
+}
+export async function unbindHostFromPort(hostId: string, portId: string): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('DELETE FROM lan_bindings WHERE hostId = ? AND portId = ?');
+  stmt.run([hostId, portId]); stmt.free();
+}
+
+// ---------------- LAN: notes ----------------
+export async function setLanNote(mapId: string, subnet: string, scope: 'lan'|'switch'|'port'|'host', scopeId: string | null, text: string): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('INSERT INTO lan_notes (mapId, subnet, scope, scopeId, text) VALUES (?, ?, ?, ?, ?) ON CONFLICT(mapId, subnet, scope, scopeId) DO UPDATE SET text=excluded.text');
+  stmt.run([mapId, subnet, scope, scopeId, text]);
+  stmt.free();
+  await touchMap(mapId);
+}
+export async function getLanNotes(mapId: string, subnet: string): Promise<Map<string, string>> {
+  const db = getDb();
+  const out = new Map<string, string>();
+  const stmt = db.prepare('SELECT scope || ":" || COALESCE(scopeId, "") AS k, text FROM lan_notes WHERE mapId = ? AND subnet = ?');
+  stmt.bind([mapId, subnet]);
+  while (stmt.step()) { const r = stmt.get(); out.set(r[0] as string, r[1] as string); }
+  stmt.free();
+  return out;
+}
+
+// Helper: list manual host IPs for union with parsed hosts
+export async function listManualHostIps(mapId: string, subnet: string): Promise<string[]> {
+  const db = getDb();
+  const ips: string[] = [];
+  const stmt = db.prepare('SELECT ip FROM lan_hosts WHERE mapId = ? AND subnet = ? AND ip IS NOT NULL AND ip <> ""');
+  stmt.bind([mapId, subnet]);
+  while (stmt.step()) { const r = stmt.get(); ips.push(r[0] as string); }
+  stmt.free();
+  return ips;
 }

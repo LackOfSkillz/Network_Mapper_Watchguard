@@ -15,6 +15,7 @@ import {
   getEdgeNotesFor, setEdgeNoteFor,
   addMapDevice, listMapDevices, getMapAllXmlTexts,
   deleteMap, renameFirstDeviceForMap,
+  listManualHostIps,
   type MapRow
 } from './db';
 
@@ -560,10 +561,22 @@ export default function App() {
     );
   }, [allPolicies, activeSubnet, activeHost, policiesForSubnet]);
 
+  const [manualHosts, setManualHosts] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    (async () => {
+      if (!mapId || !activeSubnet) { setManualHosts([]); return; }
+      try { const ips = await listManualHostIps(mapId, activeSubnet); setManualHosts(ips); }
+      catch { setManualHosts([]); }
+    })();
+  }, [mapId, activeSubnet]);
+
   const hostList = React.useMemo(() => {
     if (!activeSubnet) return [];
-    return hostsForSubnet(activeSubnet);
-  }, [activeSubnet, hostsForSubnet]);
+    const parsed = hostsForSubnet(activeSubnet);
+    const set = new Set(parsed);
+    for (const ip of manualHosts) set.add(ip);
+    return Array.from(set).sort();
+  }, [activeSubnet, hostsForSubnet, manualHosts]);
 
   // ---------- Search (select /24 node for an IP) ----------
   const onSearch = React.useCallback(() => {
@@ -855,8 +868,9 @@ export default function App() {
         />
 
         {/* LAN Focus overlay */}
-        {lanFocusSubnet && (
+        {lanFocusSubnet && mapId && (
           <LanOverlay
+            mapId={mapId}
             subnet={lanFocusSubnet}
             onClose={() => setLanFocusSubnet(null)}
           />
