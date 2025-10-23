@@ -26,7 +26,7 @@ export function radialPositions(
   return positions
 }
 
-export function styleSheet(): cytoscape.Stylesheet[] {
+export function styleSheet(): any[] {
   return [
     {
       selector: 'node',

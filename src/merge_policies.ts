@@ -9,7 +9,7 @@ type AnyPolicy = Partial<UnifiedPolicy> & {
   // legacy compat
   from?: string[];
   to?: string[];
-  source?: 'XML' | 'XLS';
+  source?: 'XML' | 'XLS' | 'PDF';
 };
 
 function arr(x: any): string[] {
@@ -63,7 +63,7 @@ export function mergePolicies(xmlPolicies: AnyPolicy[], xlsPolicies: AnyPolicy[]
   const out: UnifiedPolicy[] = [];
   const seen = new Set<string>();
 
-  const push = (raw: AnyPolicy, source: 'XML' | 'XLS') => {
+  const push = (raw: AnyPolicy, source: 'XML' | 'XLS' | 'PDF') => {
     const norm = normalize({ ...raw, source });
     const k = keyOf(norm);
     if (!seen.has(k)) {
@@ -75,5 +75,19 @@ export function mergePolicies(xmlPolicies: AnyPolicy[], xlsPolicies: AnyPolicy[]
   (xmlPolicies || []).forEach(p => push(p, 'XML'));
   (xlsPolicies || []).forEach(p => push(p, 'XLS'));
 
+  return out;
+}
+
+export function mergePolicies3(xmlPolicies: AnyPolicy[], xlsPolicies: AnyPolicy[], pdfPolicies: AnyPolicy[]): UnifiedPolicy[] {
+  const out: UnifiedPolicy[] = [];
+  const seen = new Set<string>();
+  const push = (raw: AnyPolicy, source: 'XML' | 'XLS' | 'PDF') => {
+    const norm = normalize({ ...raw, source });
+    const k = keyOf(norm);
+    if (!seen.has(k)) { seen.add(k); out.push(norm); }
+  };
+  (xmlPolicies || []).forEach(p => push(p, 'XML'));
+  (xlsPolicies || []).forEach(p => push(p, 'XLS'));
+  (pdfPolicies || []).forEach(p => push(p, 'PDF'));
   return out;
 }

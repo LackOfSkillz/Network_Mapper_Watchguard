@@ -19,7 +19,7 @@ export type UnifiedPolicy = {
   dstCidrs: string[];
   srcHosts: string[];
   dstHosts: string[];
-  source: 'XML' | 'XLS';
+  source: 'XML' | 'XLS' | 'PDF';
   tags?: string[];
   nat?: { dnat?: boolean; oneToOne?: boolean };
   debug?: string[];

@@ -13,6 +13,8 @@ export type InterfaceInfo = {
   zone?: 'Trusted' | 'Optional' | 'External' | 'Custom';
   cidrs: Cidr[];
   vlanId?: string; // <-- NEW: for vlan-interface nodes
+  primaryIp?: string; // primary interface IP (gateway IP for that subnet)
+  networkName?: string; // optional friendly network name (from VLAN/interface description or report)
 };
 
 export type AddressGroupMember =
@@ -83,16 +85,24 @@ function toCidr(ip: string, mask: string): string {
 
 // ----------------------------- parsing -----------------------------
 
+function parseFromDoc(xmlText: string, doc: Document): RawConfig {
+  const aliasesByName = parseAliases(doc);
+  const addrGroupsByName = parseAddressGroups(doc);
+  const interfacesByName = parseInterfaces(doc);
+  return { xmlText, aliasesByName, addrGroupsByName, interfacesByName };
+}
+
 export async function parseWatchGuardXml(file: File): Promise<RawConfig> {
   const xmlText = await file.text();
   const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
   if (doc.querySelector('parsererror')) throw new Error('Invalid XML');
+  return parseFromDoc(xmlText, doc);
+}
 
-  const aliasesByName = parseAliases(doc);
-  const addrGroupsByName = parseAddressGroups(doc);
-  const interfacesByName = parseInterfaces(doc);
-
-  return { xmlText, aliasesByName, addrGroupsByName, interfacesByName };
+export async function parseWatchGuardXmlText(xmlText: string): Promise<RawConfig> {
+  const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('Invalid XML');
+  return parseFromDoc(xmlText, doc);
 }
 
 const BUILTINS = new Set(['Any-Trusted', 'Any-Optional', 'Any-External', 'Firebox', 'Any']);
@@ -170,7 +180,7 @@ function parseInterfaces(doc: Document): Map<string, InterfaceInfo> {
       const smask = textContent(s, 'ip-mask');
       if (sip && smask) cidrs.push(toCidr(sip, smask));
     });
-    if (name) map.set(name, { name, zone, cidrs });
+    if (name) map.set(name, { name, zone, cidrs, primaryIp: ip });
   });
 
   // VLAN interfaces
@@ -187,7 +197,7 @@ function parseInterfaces(doc: Document): Map<string, InterfaceInfo> {
       const smask = textContent(s, 'ip-mask');
       if (sip && smask) cidrs.push(toCidr(sip, smask));
     });
-    if (name) map.set(name, { name, zone, cidrs, vlanId });
+    if (name) map.set(name, { name, zone, cidrs, vlanId, primaryIp: ip });
   });
 
   return map;

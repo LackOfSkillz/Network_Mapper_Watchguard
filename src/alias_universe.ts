@@ -1,5 +1,7 @@
 // src/alias_universe.ts
-import type { RawFW } from './parse_watchguard'
+
+// Local minimal type to satisfy TS; module not used by main App.
+type RawFW = { ags: Array<{ name: string; members: Array<{ kind: string; value: string }> }> }
 
 export type Domain = {
   ifaceNets: Array<{ cidr:string; iface:string; metaName?:string; metaDesc?:string; zone?: 'Trusted'|'Optional'|'External' }>
@@ -17,7 +19,7 @@ export type ResolvedAlias = {
 
 export function makeAliasUniverse(raw: RawFW, domain: Domain) {
   const rawMap = new Map<string, Array<{ kind:string; value:string }>>()
-  raw.ags.forEach(ag => rawMap.set(ag.name, ag.members as any))
+  raw.ags.forEach((ag: { name: string; members: Array<{ kind: string; value: string }> }) => rawMap.set(ag.name, ag.members as any))
 
   // treat interface names as aliases → map to their subnets
   for (const i of domain.ifaceNets) {
