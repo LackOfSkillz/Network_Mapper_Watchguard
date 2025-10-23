@@ -45,3 +45,12 @@ pnpm-*.log*
 *.sqlite-journal
 /wgmap.sqlite
 /data/*.db
+ 
+# Office and spreadsheets
+# Prevent accidental commits of local spreadsheet sources
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+# Explicitly ignore the known sensitive file name
+IP Subnet Master 10.xls.xlsx
