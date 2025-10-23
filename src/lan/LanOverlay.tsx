@@ -2,9 +2,26 @@ import React from 'react';
 import {
   listLanSwitches, upsertLanSwitch, deleteLanSwitch,
   listLanHosts, upsertLanHost, deleteLanHost,
-  type LanSwitch, type LanHost
+  listLanPorts, upsertLanPort, deleteLanPort,
+  listLanVlans, upsertLanVlan, deleteLanVlan,
+  getPortVlans, setPortVlanBinding, clearPortVlanBinding,
+  getLanNotes, setLanNote,
+  type LanSwitch, type LanHost, type LanPort, type LanVlan
 } from '../db';
 import cytoscape, { Core } from 'cytoscape';
+
+const btnBase: React.CSSProperties = {
+  padding: '6px 10px',
+  background: '#13203a',
+  border: '1px solid #223154',
+  color: '#e6edf7',
+  borderRadius: 6,
+  fontSize: 12,
+  cursor: 'pointer'
+};
+const btnPrimary: React.CSSProperties = { ...btnBase, background: '#1d4ed8', border: '1px solid #1e3a8a' };
+const btnSecondary: React.CSSProperties = { ...btnBase, background: '#0b1424', border: '1px solid #1f2a44' };
+const menuBtn: React.CSSProperties = { ...btnBase, width: '100%', textAlign: 'left', marginBottom: 4 } as React.CSSProperties;
 
 type Props = { mapId: string; subnet: string; onClose: () => void };
 
@@ -14,18 +31,50 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
   const [hosts, setHosts] = React.useState<LanHost[]>([]);
   const [addingSwitch, setAddingSwitch] = React.useState<{ name: string; model?: string; mgmtIp?: string }>({ name: '' });
   const [addingHost, setAddingHost] = React.useState<{ ip: string; name?: string }>({ ip: '' });
+  const [selectedSwitchId, setSelectedSwitchId] = React.useState<string | null>(null);
+  const [ports, setPorts] = React.useState<LanPort[]>([]);
+  const [vlans, setVlans] = React.useState<LanVlan[]>([]);
+  const [addingPort, setAddingPort] = React.useState<{ idx?: number; name?: string; poe?: boolean; speed?: string }>({});
+  const [addingVlan, setAddingVlan] = React.useState<{ vid?: number; name?: string }>({});
+  const [portVlans, setPortVlans] = React.useState<Record<string, Set<string>>>({});
   const cyRef = React.useRef<Core | null>(null);
   const containerRef = React.useRef<HTMLDivElement | null>(null);
+  const overlayRef = React.useRef<HTMLDivElement | null>(null);
+  const [ctx, setCtx] = React.useState<null | { x: number; y: number; kind: 'switch'|'host'; id: string; label: string }>(null);
+  const [noteModal, setNoteModal] = React.useState<null | { scope: 'switch'|'host'; id: string; text: string }>(null);
+  const [selected, setSelected] = React.useState<null | { kind: 'switch'|'host'; id: string }>(null);
 
   const load = React.useCallback(async () => {
     try {
       const sw = await listLanSwitches(mapId, subnet);
       const hs = await listLanHosts(mapId, subnet);
-      setSwitches(sw); setHosts(hs);
+      const vls = await listLanVlans(mapId, subnet);
+      setSwitches(sw); setHosts(hs); setVlans(vls);
+      // Maintain selection if possible
+      if (sw.length > 0 && (!selectedSwitchId || !sw.find(s => s.id === selectedSwitchId))) {
+        setSelectedSwitchId(sw[0].id);
+      }
     } catch (e) { console.error(e); }
-  }, [mapId, subnet]);
+  }, [mapId, subnet, selectedSwitchId]);
 
   React.useEffect(() => { void load(); }, [load]);
+
+  // Load ports for selected switch and their VLAN bindings
+  React.useEffect(() => {
+    (async () => {
+      if (!selectedSwitchId) { setPorts([]); setPortVlans({}); return; }
+      try {
+        const p = await listLanPorts(selectedSwitchId);
+        setPorts(p);
+        const map: Record<string, Set<string>> = {};
+        for (const port of p) {
+          const v = await getPortVlans(port.id);
+          map[port.id] = new Set(v.map(x => x.vlanId));
+        }
+        setPortVlans(map);
+      } catch (e) { console.error(e); }
+    })();
+  }, [selectedSwitchId]);
 
   // Build/refresh LAN Cytoscape micro-graph
   React.useEffect(() => {
@@ -43,6 +92,22 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
         ],
       });
       const cy = cyRef.current;
+      // Select on tap
+      cy.on('tap', 'node', (evt) => {
+        try {
+          const n = evt.target; const d = n.data();
+          setSelected(d.kind === 'switch' ? { kind: 'switch', id: d.sid } : { kind: 'host', id: d.hid });
+        } catch {}
+      });
+      // Context menu (right-click)
+      cy.on('cxttap', 'node', (evt) => {
+        try {
+          const n = evt.target; const d = n.data();
+          const rp = (evt as any).renderedPosition || evt.position;
+          const label: string = n.data('label') || '';
+          setCtx({ x: rp.x, y: rp.y, kind: d.kind, id: d.kind==='switch' ? d.sid : d.hid, label });
+        } catch {}
+      });
       // Persist position after drag
       cy.on('dragfree', 'node', async (evt) => {
         try {
@@ -89,6 +154,21 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
     });
     try { cy.fit(cy.elements(), 50); } catch {}
   }, [switches, hosts, mapId, subnet]);
+
+  // Global key handlers (ESC handled above in parent, here handle Delete)
+  React.useEffect(() => {
+    const onKey = async (e: KeyboardEvent) => {
+      if (e.key === 'Delete' && selected) {
+        e.preventDefault();
+        if (selected.kind === 'switch') { await deleteLanSwitch(mapId, selected.id); }
+        else { await deleteLanHost(mapId, selected.id); }
+        await load(); setSelected(null);
+      }
+      if (e.key === 'Escape') setCtx(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selected, mapId, load]);
   // ESC to close
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -113,7 +193,7 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
             <div style={{ display: 'grid', gap: 4 }}>
               {switches.length === 0 && <div style={{ opacity: 0.7, fontSize: 12 }}>No switches yet.</div>}
               {switches.map(sw => (
-                <div key={sw.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6 }}>
+                <div key={sw.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: selectedSwitchId===sw.id ? '#112240' : '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6, cursor: 'pointer' }} onClick={()=>setSelectedSwitchId(sw.id)}>
                   <div style={{ fontWeight: 600 }}>{sw.name || 'Switch'}</div>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>{sw.model || ''}</div>
                   <div style={{ marginLeft: 'auto', fontSize: 12, opacity: 0.8 }}>{sw.mgmtIp || ''}</div>
@@ -124,10 +204,87 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
           </div>
         </Section>
         <Section title="Ports">
-          <div style={{ opacity: 0.8, fontSize: 12 }}>Per-switch ports with status, PoE, speed, VLAN tagging.</div>
+          {!selectedSwitchId && (
+            <div style={{ opacity: 0.8, fontSize: 12 }}>Select a switch to manage its ports.</div>
+          )}
+          {selectedSwitchId && (
+            <div style={{ display: 'grid', gap: 8 }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <input type="number" value={addingPort.idx ?? ''} onChange={e=>setAddingPort(p=>({...p, idx: e.target.value===''? undefined : Number(e.target.value)}))} placeholder="#" style={{ ...inputStyle, width: 70 }} />
+                <input value={addingPort.name ?? ''} onChange={e=>setAddingPort(p=>({...p, name: e.target.value}))} placeholder="Port name" style={inputStyle} />
+                <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                  <input type="checkbox" checked={!!addingPort.poe} onChange={e=>setAddingPort(p=>({...p, poe: e.target.checked}))} /> PoE
+                </label>
+                <select value={addingPort.speed ?? ''} onChange={e=>setAddingPort(p=>({...p, speed: e.target.value||undefined}))} style={inputStyle as any}>
+                  <option value="">Auto</option>
+                  <option value="1G">1G</option>
+                  <option value="2.5G">2.5G</option>
+                  <option value="10G">10G</option>
+                </select>
+                <button type="button" style={btnPrimary} onClick={async ()=>{
+                  await upsertLanPort({ switchId: selectedSwitchId, idx: addingPort.idx, name: (addingPort.name||'').trim() || undefined, poe: !!addingPort.poe, speed: addingPort.speed });
+                  setAddingPort({});
+                  // reload ports
+                  const p = await listLanPorts(selectedSwitchId);
+                  setPorts(p);
+                }}>Add</button>
+              </div>
+              <div style={{ display: 'grid', gap: 6 }}>
+                {ports.length === 0 && <div style={{ opacity: 0.7, fontSize: 12 }}>No ports yet.</div>}
+                {ports.map(pt => (
+                  <div key={pt.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(80px,auto) minmax(80px,auto) 1fr auto', gap: 8, alignItems: 'center', background: '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6 }}>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>#{pt.idx ?? '-'} {pt.name || ''}</div>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>{pt.poe ? 'PoE' : ''} {pt.speed || ''}</div>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {vlans.map(v => {
+                        const checked = !!portVlans[pt.id]?.has(v.id);
+                        return (
+                          <label key={v.id} style={{ display: 'flex', alignItems: 'center', gap: 4, background: checked ? '#112240' : '#0f1a2b', border: '1px solid #1f2a44', padding: '2px 6px', borderRadius: 6, fontSize: 12 }}>
+                            <input type="checkbox" checked={checked} onChange={async (e)=>{
+                              const next = new Set(portVlans[pt.id] || new Set<string>());
+                              if (e.target.checked) {
+                                await setPortVlanBinding(pt.id, v.id, 'access', true);
+                                next.add(v.id);
+                              } else {
+                                await clearPortVlanBinding(pt.id, v.id);
+                                next.delete(v.id);
+                              }
+                              setPortVlans(prev => ({ ...prev, [pt.id]: next }));
+                            }} />
+                            VLAN {v.vid ?? ''} {v.name || ''}
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <button type="button" style={btnDanger} onClick={async ()=>{ await deleteLanPort(pt.id); setPorts(ports.filter(x=>x.id!==pt.id)); }}>Delete</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </Section>
         <Section title="VLANs">
-          <div style={{ opacity: 0.8, fontSize: 12 }}>Define VLANs and assign to ports (access/trunk/native).</div>
+          <div style={{ display: 'grid', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <input type="number" value={addingVlan.vid ?? ''} onChange={e=>setAddingVlan(v=>({...v, vid: e.target.value===''? undefined : Number(e.target.value)}))} placeholder="VID" style={{ ...inputStyle, width: 90 }} />
+              <input value={addingVlan.name ?? ''} onChange={e=>setAddingVlan(v=>({...v, name: e.target.value}))} placeholder="Name" style={inputStyle} />
+              <button type="button" style={btnPrimary} onClick={async ()=>{
+                await upsertLanVlan({ mapId, subnet, vid: addingVlan.vid, name: (addingVlan.name||'').trim() || undefined });
+                setAddingVlan({});
+                const vls = await listLanVlans(mapId, subnet);
+                setVlans(vls);
+              }}>Add</button>
+            </div>
+            <div style={{ display: 'grid', gap: 6 }}>
+              {vlans.length === 0 && <div style={{ opacity: 0.7, fontSize: 12 }}>No VLANs yet.</div>}
+              {vlans.map(v => (
+                <div key={v.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6 }}>
+                  <div style={{ fontWeight: 600 }}>VLAN {v.vid ?? '-'} {v.name || ''}</div>
+                  <button type="button" style={{ marginLeft: 'auto', ...btnDanger }} onClick={async ()=>{ await deleteLanVlan(mapId, v.id); setVlans(vlans.filter(x=>x.id!==v.id)); }}>Delete</button>
+                </div>
+              ))}
+            </div>
+          </div>
         </Section>
         <Section title="Hosts">
           <div style={{ display: 'grid', gap: 6 }}>
@@ -151,7 +308,7 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
       </div>
 
       {/* Center LAN graph placeholder and breadcrumb */}
-      <div style={{ position: 'relative', background: '#0e1726' }}>
+  <div ref={overlayRef} style={{ position: 'relative', background: '#0e1726' }}>
         {/* Breadcrumb header */}
         <div style={{ position: 'absolute', left: 12, top: 8, zIndex: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
           <div style={{ background: '#13203a', border: '1px solid #223154', color: '#e6edf7', padding: '6px 10px', borderRadius: 6 }}>
@@ -162,6 +319,41 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
         </div>
         {/* Cytoscape instance container for LAN graph */}
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+
+        {/* Context menu */}
+        {ctx && (
+          <div style={{ position: 'absolute', left: Math.max(8, ctx.x - 10), top: Math.max(40, ctx.y - 10), zIndex: 5, background: '#13203a', border: '1px solid #223154', borderRadius: 8, padding: 6, minWidth: 160 }}
+               onClick={e=>e.stopPropagation()} onContextMenu={e=>{ e.preventDefault(); e.stopPropagation(); }}>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>{ctx.label}</div>
+            <button type="button" style={menuBtn} onClick={async ()=>{
+              try {
+                const key = `${ctx.kind}:${ctx.id}`;
+                const m = await getLanNotes(mapId, subnet);
+                const existing = m.get(key) || '';
+                setNoteModal({ scope: ctx.kind, id: ctx.id, text: existing });
+              } finally { setCtx(null); }
+            }}>Notes…</button>
+            <button type="button" style={{ ...menuBtn, color: '#fff', background: '#7f1d1d', border: 'none' }} onClick={async ()=>{
+              if (ctx.kind === 'switch') await deleteLanSwitch(mapId, ctx.id); else await deleteLanHost(mapId, ctx.id);
+              await load(); setCtx(null);
+            }}>Delete</button>
+          </div>
+        )}
+
+        {/* Notes modal */}
+        {noteModal && (
+          <div style={{ position: 'absolute', inset: 0, zIndex: 6, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.35)' }} onClick={()=>setNoteModal(null)}>
+            <div style={{ background: '#0f1a2b', border: '1px solid #1f2a44', borderRadius: 8, padding: 12, minWidth: 360 }} onClick={e=>e.stopPropagation()}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>Edit notes</div>
+              <textarea value={noteModal.text} onChange={e=>setNoteModal({ ...noteModal, text: e.target.value })}
+                        style={{ width: '100%', height: 120, background: '#0b1424', color: '#e6edf7', border: '1px solid #1f2a44', borderRadius: 6, padding: 8 }} />
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 10 }}>
+                <button type="button" onClick={()=>setNoteModal(null)} style={btnSecondary}>Cancel</button>
+                <button type="button" onClick={async ()=>{ try { await setLanNote(mapId, subnet, noteModal.scope, noteModal.id, noteModal.text.trim()); } finally { setNoteModal(null); } }} style={btnPrimary}>Save</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -186,5 +378,4 @@ function Section({ title, children }: { title: string; children?: React.ReactNod
 }
 
 const inputStyle: React.CSSProperties = { background: '#0b1424', color: '#e6edf7', border: '1px solid #1f2a44', borderRadius: 6, padding: '6px 8px', minWidth: 0 };
-const btnPrimary: React.CSSProperties = { background: '#1d4ed8', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' };
 const btnDanger: React.CSSProperties = { background: '#7f1d1d', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' };
