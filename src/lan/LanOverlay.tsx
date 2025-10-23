@@ -4,6 +4,7 @@ import {
   listLanHosts, upsertLanHost, deleteLanHost,
   type LanSwitch, type LanHost
 } from '../db';
+import cytoscape, { Core } from 'cytoscape';
 
 type Props = { mapId: string; subnet: string; onClose: () => void };
 
@@ -13,6 +14,8 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
   const [hosts, setHosts] = React.useState<LanHost[]>([]);
   const [addingSwitch, setAddingSwitch] = React.useState<{ name: string; model?: string; mgmtIp?: string }>({ name: '' });
   const [addingHost, setAddingHost] = React.useState<{ ip: string; name?: string }>({ ip: '' });
+  const cyRef = React.useRef<Core | null>(null);
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
 
   const load = React.useCallback(async () => {
     try {
@@ -23,6 +26,69 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
   }, [mapId, subnet]);
 
   React.useEffect(() => { void load(); }, [load]);
+
+  // Build/refresh LAN Cytoscape micro-graph
+  React.useEffect(() => {
+    if (!containerRef.current) return;
+    if (!cyRef.current) {
+      cyRef.current = cytoscape({
+        container: containerRef.current,
+        elements: [],
+        style: [
+          { selector: 'node', style: { 'background-color': '#1b2942', 'border-color': '#3b4d75', 'border-width': 2, 'label': 'data(label)', 'color': '#e6edf7', 'font-size': 11, 'text-wrap': 'wrap', 'text-max-width': '160px' } },
+          { selector: 'node[type = "switch"]', style: { 'shape': 'round-rectangle', 'padding': '8px 10px', 'width': 'label', 'height': 'label' } },
+          { selector: 'node[type = "host"]', style: { 'shape': 'ellipse', 'width': 26, 'height': 26, 'text-valign': 'bottom', 'text-margin-y': -6 } },
+          { selector: 'edge', style: { 'width': 2, 'line-color': '#6b7daa', 'curve-style': 'bezier' } },
+          { selector: '.active', style: { 'border-color': '#4f8ef7', 'border-width': 3 } },
+        ],
+      });
+      const cy = cyRef.current;
+      // Persist position after drag
+      cy.on('dragfree', 'node', async (evt) => {
+        try {
+          const n = evt.target; const data = n.data();
+          const p = n.position();
+          if (data.kind === 'switch') {
+            await upsertLanSwitch({ id: data.sid, mapId, subnet, posX: p.x, posY: p.y });
+          } else if (data.kind === 'host') {
+            await upsertLanHost({ id: data.hid, mapId, subnet, posX: p.x, posY: p.y });
+          }
+        } catch (e) { console.error(e); }
+      });
+    }
+    const cy = cyRef.current!;
+    // Rebuild elements from current switches/hosts
+    cy.elements().remove();
+    // Layout helpers
+    const sx = switches.length;
+    const spacingX = 200;
+    const baseY = 160;
+    switches.forEach((sw, idx) => {
+      const id = `sw:${sw.id}`;
+      const label = sw.name || 'Switch';
+      const node = cy.add({ group: 'nodes', data: { id, label, kind: 'switch', sid: sw.id, type: 'switch' } });
+      if (typeof sw.posX === 'number' && typeof sw.posY === 'number') {
+        node.position({ x: sw.posX, y: sw.posY });
+      } else {
+        node.position({ x: (idx - (sx-1)/2) * spacingX, y: baseY });
+      }
+      (node as any).grabbable(true);
+    });
+    const hx = hosts.length;
+    const hostRowY = baseY + 160;
+    hosts.forEach((h, idx) => {
+      const id = `host:${h.id}`;
+      const label = h.name ? `${h.name}\n${h.ip || ''}` : (h.ip || 'host');
+      const node = cy.add({ group: 'nodes', data: { id, label, kind: 'host', hid: h.id, type: 'host' } });
+      if (typeof h.posX === 'number' && typeof h.posY === 'number') {
+        node.position({ x: h.posX, y: h.posY });
+      } else {
+        node.position({ x: (idx - (hx-1)/2) * 160, y: hostRowY });
+      }
+      (node as any).grabbable(true);
+    });
+    try { cy.fit(cy.elements(), 50); } catch {}
+  }, [switches, hosts, mapId, subnet]);
   // ESC to close
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -92,14 +158,10 @@ export default function LanOverlay({ mapId, subnet, onClose }: Props) {
             LAN Focus: {subnet}
           </div>
           <button type="button" onClick={onClose} style={{ background: '#1d4ed8', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+          <button type="button" onClick={()=>{ const cy = cyRef.current; if (!cy) return; try { cy.fit(cy.elements(), 50); } catch {} }} style={{ background: '#0b1424', color: '#e6edf7', border: '1px solid #1f2a44', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Fit</button>
         </div>
-        {/* Future: Cytoscape instance container for LAN graph */}
-        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#a1b3d6' }}>
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: 18, marginBottom: 8 }}>LAN graph coming next</div>
-            <div style={{ fontSize: 12, opacity: 0.8 }}>We’ll render switches/ports/hosts with persisted layout here.</div>
-          </div>
-        </div>
+        {/* Cytoscape instance container for LAN graph */}
+        <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
       </div>
     </div>
   );
