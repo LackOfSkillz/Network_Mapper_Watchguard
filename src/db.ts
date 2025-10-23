@@ -95,7 +95,9 @@ export async function initDb(): Promise<void> {
       location TEXT,
       meta TEXT,
       posX REAL,
-      posY REAL
+      posY REAL,
+      managed INTEGER,
+      portCount INTEGER
     );
     CREATE TABLE IF NOT EXISTS lan_ports (
       id TEXT PRIMARY KEY,
@@ -409,24 +411,33 @@ export async function deleteMap(id: string): Promise<void> {
 }
 
 // ---------------- LAN: switches ----------------
-export type LanSwitch = { id: string; mapId: string; subnet: string; name?: string; model?: string; mgmtIp?: string; location?: string; meta?: string; posX?: number; posY?: number };
+export type LanSwitch = { id: string; mapId: string; subnet: string; name?: string; model?: string; mgmtIp?: string; location?: string; meta?: string; posX?: number; posY?: number; managed?: boolean; portCount?: number };
 export async function listLanSwitches(mapId: string, subnet: string): Promise<LanSwitch[]> {
   const db = getDb();
   const out: LanSwitch[] = [];
-  const stmt = db.prepare('SELECT id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY FROM lan_switches WHERE mapId = ? AND subnet = ? ORDER BY name');
+  const stmt = db.prepare('SELECT id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY, COALESCE(managed, 1), COALESCE(portCount, 0) FROM lan_switches WHERE mapId = ? AND subnet = ? ORDER BY name');
   stmt.bind([mapId, subnet]);
   while (stmt.step()) {
     const r = stmt.get();
-    out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, name: r[3] as string | undefined, model: r[4] as string | undefined, mgmtIp: r[5] as string | undefined, location: r[6] as string | undefined, meta: r[7] as string | undefined, posX: r[8] as number | undefined, posY: r[9] as number | undefined });
+    out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, name: r[3] as string | undefined, model: r[4] as string | undefined, mgmtIp: r[5] as string | undefined, location: r[6] as string | undefined, meta: r[7] as string | undefined, posX: r[8] as number | undefined, posY: r[9] as number | undefined, managed: !!r[10], portCount: (r[11] as number|undefined) ?? undefined });
   }
+  stmt.free();
+  return out;
+}
+export async function listAllMapSwitches(mapId: string): Promise<LanSwitch[]> {
+  const db = getDb();
+  const out: LanSwitch[] = [];
+  const stmt = db.prepare('SELECT id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY, COALESCE(managed, 1), COALESCE(portCount, 0) FROM lan_switches WHERE mapId = ? ORDER BY name');
+  stmt.bind([mapId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, name: r[3] as string | undefined, model: r[4] as string | undefined, mgmtIp: r[5] as string | undefined, location: r[6] as string | undefined, meta: r[7] as string | undefined, posX: r[8] as number | undefined, posY: r[9] as number | undefined, managed: !!r[10], portCount: (r[11] as number|undefined) ?? undefined }); }
   stmt.free();
   return out;
 }
 export async function upsertLanSwitch(partial: Partial<LanSwitch> & { mapId: string; subnet: string }): Promise<string> {
   const db = getDb();
   const id = partial.id || (uuid());
-  const stmt = db.prepare('INSERT INTO lan_switches (id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, model=excluded.model, mgmtIp=excluded.mgmtIp, location=excluded.location, meta=excluded.meta, posX=excluded.posX, posY=excluded.posY');
-  stmt.run([id, partial.mapId, partial.subnet, partial.name || null, partial.model || null, partial.mgmtIp || null, partial.location || null, partial.meta || null, partial.posX ?? null, partial.posY ?? null]);
+  const stmt = db.prepare('INSERT INTO lan_switches (id, mapId, subnet, name, model, mgmtIp, location, meta, posX, posY, managed, portCount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, model=excluded.model, mgmtIp=excluded.mgmtIp, location=excluded.location, meta=excluded.meta, posX=excluded.posX, posY=excluded.posY, managed=excluded.managed, portCount=excluded.portCount');
+  stmt.run([id, partial.mapId, partial.subnet, partial.name || null, partial.model || null, partial.mgmtIp || null, partial.location || null, partial.meta || null, partial.posX ?? null, partial.posY ?? null, partial.managed ? 1 : 0, partial.portCount ?? null]);
   stmt.free();
   await touchMap(partial.mapId);
   return id;
@@ -534,6 +545,15 @@ export async function listLanHosts(mapId: string, subnet: string): Promise<LanHo
   stmt.free();
   return out;
 }
+export async function listAllLanHosts(mapId: string): Promise<LanHost[]> {
+  const db = getDb();
+  const out: LanHost[] = [];
+  const stmt = db.prepare('SELECT id, mapId, subnet, ip, mac, name, note, source, kind, posX, posY FROM lan_hosts WHERE mapId = ? ORDER BY subnet, ip');
+  stmt.bind([mapId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, ip: r[3] as string | undefined, mac: r[4] as string | undefined, name: r[5] as string | undefined, note: r[6] as string | undefined, source: r[7] as string | undefined, kind: r[8] as string | undefined, posX: r[9] as number | undefined, posY: r[10] as number | undefined }); }
+  stmt.free();
+  return out;
+}
 export async function upsertLanHost(partial: Partial<LanHost> & { mapId: string; subnet: string }): Promise<string> {
   const db = getDb();
   const id = partial.id || (uuid());
@@ -597,6 +617,8 @@ export async function listManualHostIps(mapId: string, subnet: string): Promise<
 // Schema migrations (safe, idempotent)
 try { getDb(); } catch {}
 try { db && db.exec('ALTER TABLE lan_hosts ADD COLUMN kind TEXT'); } catch {}
+try { db && db.exec('ALTER TABLE lan_switches ADD COLUMN managed INTEGER'); } catch {}
+try { db && db.exec('ALTER TABLE lan_switches ADD COLUMN portCount INTEGER'); } catch {}
 
 // ---------------- Locations ----------------
 export type LanLocation = { id: string; mapId: string; name: string; address?: string; notes?: string };

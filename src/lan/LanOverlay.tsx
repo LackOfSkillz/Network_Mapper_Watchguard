@@ -2,14 +2,23 @@ import React from 'react';
 import {
   listLanSwitches, upsertLanSwitch, deleteLanSwitch,
   listLanHosts, upsertLanHost, deleteLanHost,
+  listAllMapSwitches, listAllLanHosts,
   listLanPorts, upsertLanPort, deleteLanPort,
   listLanVlans, upsertLanVlan, deleteLanVlan,
   getPortVlans, setPortVlanBinding, clearPortVlanBinding,
   getLanNotes, setLanNote,
   listLanLocations, upsertLanLocation, setSwitchLocation,
+  bindHostToPort,
   type LanSwitch, type LanHost, type LanPort, type LanVlan
 } from '../db';
 import cytoscape, { Core } from 'cytoscape';
+
+function subnetColor(key: string): string {
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  return `hsl(${hue} 70% 75%)`;
+}
 
 const btnBase: React.CSSProperties = {
   padding: '6px 10px',
@@ -30,7 +39,9 @@ type Props = { mapId: string; subnet: string; onClose: () => void; knownHostIps?
 export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Props) {
   const [switches, setSwitches] = React.useState<LanSwitch[]>([]);
   const [hosts, setHosts] = React.useState<LanHost[]>([]);
-  const [addingSwitch, setAddingSwitch] = React.useState<{ name: string; model?: string; mgmtIp?: string }>({ name: '' });
+  const [allSwitches, setAllSwitches] = React.useState<LanSwitch[]>([]);
+  const [allHosts, setAllHosts] = React.useState<LanHost[]>([]);
+  const [addingSwitch, setAddingSwitch] = React.useState<{ name: string; model?: string; mgmtIp?: string; managed?: boolean; portCount?: number }>({ name: '', managed: true });
   const [addingHost, setAddingHost] = React.useState<{ ip: string; name?: string; kind?: string }>({ ip: '' });
   const [selectedSwitchId, setSelectedSwitchId] = React.useState<string | null>(null);
   const [ports, setPorts] = React.useState<LanPort[]>([]);
@@ -46,6 +57,11 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   const [selected, setSelected] = React.useState<null | { kind: 'switch'|'host'; id: string }>(null);
   const [locationModal, setLocationModal] = React.useState<null | { name: string; address?: string; applyToVisible: boolean }>(null);
   const [locations, setLocations] = React.useState<Array<{ name: string; address?: string }>>([]);
+  const [viewMode, setViewMode] = React.useState<'focus'|'location'>('focus');
+  const [selectedLocation, setSelectedLocation] = React.useState<string | null>(null);
+  const [assignModal, setAssignModal] = React.useState<null | { hostId: string; switchId?: string; portId?: string; vlanId?: string }>(null);
+  const [assignPorts, setAssignPorts] = React.useState<LanPort[]>([]);
+  const leftPanelRef = React.useRef<HTMLDivElement | null>(null);
 
   const load = React.useCallback(async () => {
     try {
@@ -62,6 +78,8 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
 
   React.useEffect(() => { void load(); }, [load]);
   React.useEffect(() => { (async()=>{ try { const rows = await listLanLocations(mapId); setLocations(rows.map(r=>({ name: r.name, address: r.address }))); } catch {} })(); }, [mapId]);
+  React.useEffect(() => { (async()=>{ try { const swAll = await listAllMapSwitches(mapId); setAllSwitches(swAll); const hsAll = await listAllLanHosts(mapId); setAllHosts(hsAll); } catch {} })(); }, [mapId]);
+  React.useEffect(() => { (async()=>{ if (!assignModal?.switchId) { setAssignPorts([]); return; } try { const p = await listLanPorts(assignModal.switchId); setAssignPorts(p); } catch {} })(); }, [assignModal?.switchId]);
 
   // Prepopulate LAN hosts from parsed list (once per overlay entry or when list changes)
   React.useEffect(() => {
@@ -96,6 +114,21 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
       } catch (e) { console.error(e); }
     })();
   }, [selectedSwitchId]);
+
+  // Helpers for location mode
+  const graphSwitches = React.useMemo<LanSwitch[]>(() => {
+    if (viewMode === 'focus') return switches;
+    const loc = selectedLocation || (() => {
+      const freq = new Map<string, number>();
+      switches.forEach(s=>{ if (s.location) freq.set(s.location, (freq.get(s.location)||0)+1); });
+      let best: string | null = null; let score = 0; freq.forEach((v,k)=>{ if (v>score) { score=v; best=k; } });
+      return best || '';
+    })();
+    if (!loc) return switches;
+    return allSwitches.filter(s => s.location === loc);
+  }, [viewMode, switches, allSwitches, selectedLocation]);
+  const includedSubnets = React.useMemo<string[]>(() => Array.from(new Set(graphSwitches.map(s=>s.subnet).filter(Boolean) as string[])), [graphSwitches]);
+  const graphHosts = React.useMemo<LanHost[]>(() => viewMode==='focus' ? hosts : allHosts.filter(h => includedSubnets.includes(h.subnet)), [viewMode, hosts, allHosts, includedSubnets]);
 
   // Build/refresh LAN Cytoscape micro-graph
   React.useEffect(() => {
@@ -146,10 +179,10 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
     // Rebuild elements from current switches/hosts
     cy.elements().remove();
     // Layout helpers
-    const sx = switches.length;
+    const sx = graphSwitches.length;
     const spacingX = 200;
     const baseY = 160;
-    switches.forEach((sw, idx) => {
+    graphSwitches.forEach((sw, idx) => {
       const id = `sw:${sw.id}`;
       const label = sw.name || 'Switch';
       const node = cy.add({ group: 'nodes', data: { id, label, kind: 'switch', sid: sw.id, type: 'switch' } });
@@ -160,9 +193,9 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
       }
       (node as any).grabbable(true);
     });
-    const hx = hosts.length;
+    const hx = graphHosts.length;
     const hostRowY = baseY + 160;
-    hosts.forEach((h, idx) => {
+    graphHosts.forEach((h, idx) => {
       const id = `host:${h.id}`;
       const label = h.name ? `${h.name}\n${h.ip || ''}` : (h.ip || 'host');
       const node = cy.add({ group: 'nodes', data: { id, label, kind: 'host', hid: h.id, type: 'host' } });
@@ -174,7 +207,7 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
       (node as any).grabbable(true);
     });
     try { cy.fit(cy.elements(), 50); } catch {}
-  }, [switches, hosts, mapId, subnet]);
+  }, [graphSwitches, graphHosts, mapId, subnet, viewMode]);
 
   // Global key handlers (ESC handled above in parent, here handle Delete)
   React.useEffect(() => {
@@ -200,7 +233,7 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   return (
     <div style={{ position: 'absolute', inset: 0, zIndex: 30, display: 'grid', gridTemplateColumns: '300px 1fr' }}>
       {/* Left LAN panel scaffold */}
-      <div style={{ background: '#0f1a2b', borderRight: '1px solid #1f2a44', padding: 10, overflow: 'auto' }}>
+  <div ref={leftPanelRef} style={{ background: '#0f1a2b', borderRight: '1px solid #1f2a44', padding: 10, overflow: 'auto' }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>LAN Panel</div>
         <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 12 }}>Subnet: {subnet}</div>
         <Section title="Switches">
@@ -209,14 +242,31 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
               <input value={addingSwitch.name} onChange={e=>setAddingSwitch(s=>({...s, name: e.target.value}))} placeholder="Switch name" style={inputStyle} onKeyDown={async (e)=>{ if (e.key==='Enter'){ if (!addingSwitch.name.trim()) return; await upsertLanSwitch({ mapId, subnet, name: addingSwitch.name.trim(), model: addingSwitch.model?.trim(), mgmtIp: addingSwitch.mgmtIp?.trim() }); setAddingSwitch({ name: '' }); await load(); } }} />
               <input value={addingSwitch.model||''} onChange={e=>setAddingSwitch(s=>({...s, model: e.target.value}))} placeholder="Model" style={inputStyle} />
               <input value={addingSwitch.mgmtIp||''} onChange={e=>setAddingSwitch(s=>({...s, mgmtIp: e.target.value}))} placeholder="Mgmt IP" style={inputStyle} />
-              <button type="button" onClick={async ()=>{ if (!addingSwitch.name.trim()) return; await upsertLanSwitch({ mapId, subnet, name: addingSwitch.name.trim(), model: addingSwitch.model?.trim(), mgmtIp: addingSwitch.mgmtIp?.trim() }); setAddingSwitch({ name: '' }); await load(); }} style={btnPrimary}>Add Switch</button>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                  <input type="checkbox" checked={addingSwitch.managed ?? true} onChange={e=>setAddingSwitch(s=>({...s, managed: e.target.checked}))} /> Managed
+                </label>
+                <select value={addingSwitch.portCount ?? ''} onChange={e=>setAddingSwitch(s=>({...s, portCount: e.target.value===''? undefined : Number(e.target.value)}))} style={inputStyle as any}>
+                  <option value="">Ports (optional)</option>
+                  <option value="8">8 ports</option>
+                  <option value="12">12 ports</option>
+                  <option value="16">16 ports</option>
+                  <option value="24">24 ports</option>
+                  <option value="48">48 ports</option>
+                </select>
+              </div>
+              <button type="button" onClick={async ()=>{ if (!addingSwitch.name.trim()) return; const swId = await upsertLanSwitch({ mapId, subnet, name: addingSwitch.name.trim(), model: addingSwitch.model?.trim(), mgmtIp: addingSwitch.mgmtIp?.trim(), managed: addingSwitch.managed ?? true, portCount: addingSwitch.portCount }); if (addingSwitch.portCount && addingSwitch.portCount > 0) { for (let i=1;i<=addingSwitch.portCount;i++){ await upsertLanPort({ switchId: swId, idx: i }); } } setAddingSwitch({ name: '', managed: true }); await load(); setSelectedSwitchId(swId); }} style={btnPrimary}>Add Switch</button>
             </div>
             <div style={{ display: 'grid', gap: 4 }}>
               {switches.length === 0 && <div style={{ opacity: 0.7, fontSize: 12 }}>No switches yet.</div>}
               {switches.map(sw => (
-                <div key={sw.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: selectedSwitchId===sw.id ? '#112240' : '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6, cursor: 'pointer' }} onClick={()=>setSelectedSwitchId(sw.id)}>
+                <div id={`switch-item-${sw.id}`} key={sw.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: selectedSwitchId===sw.id ? '#112240' : '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6, cursor: 'pointer' }} onClick={()=>setSelectedSwitchId(sw.id)}>
                   <div style={{ fontWeight: 600 }}>{sw.name || 'Switch'}</div>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>{sw.model || ''}</div>
+                  {typeof sw.portCount === 'number' && sw.portCount>0 && (
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>{sw.portCount}p</div>
+                  )}
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>{sw.managed===false ? 'Unmanaged' : 'Managed'}</div>
                   <div style={{ marginLeft: 'auto', fontSize: 12, opacity: 0.8 }}>{sw.mgmtIp || ''}</div>
                   <button type="button" title="Delete switch" onClick={async ()=>{ await deleteLanSwitch(mapId, sw.id); await load(); }} style={btnDanger}>Delete</button>
                 </div>
@@ -261,8 +311,8 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
                       {vlans.map(v => {
                         const checked = !!portVlans[pt.id]?.has(v.id);
                         return (
-                          <label key={v.id} style={{ display: 'flex', alignItems: 'center', gap: 4, background: checked ? '#112240' : '#0f1a2b', border: '1px solid #1f2a44', padding: '2px 6px', borderRadius: 6, fontSize: 12 }}>
-                            <input type="checkbox" checked={checked} onChange={async (e)=>{
+                          <label key={v.id} style={{ display: 'flex', alignItems: 'center', gap: 4, background: checked ? '#112240' : '#0f1a2b', border: '1px solid #1f2a44', padding: '2px 6px', borderRadius: 6, fontSize: 12, opacity: (switches.find(s=>s.id===selectedSwitchId)?.managed===false) ? 0.5 : 1 }}>
+                            <input type="checkbox" disabled={(switches.find(s=>s.id===selectedSwitchId)?.managed===false)} checked={checked} onChange={async (e)=>{
                               const next = new Set(portVlans[pt.id] || new Set<string>());
                               if (e.target.checked) {
                                 await setPortVlanBinding(pt.id, v.id, 'access', true);
@@ -328,7 +378,7 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
             <div style={{ display: 'grid', gap: 4 }}>
               {hosts.length === 0 && <div style={{ opacity: 0.7, fontSize: 12 }}>No manual hosts yet.</div>}
               {hosts.map(h => (
-                <div key={h.id} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, alignItems: 'center', background: '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6 }}>
+                <div id={`host-item-${h.id}`} key={h.id} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, alignItems: 'center', background: '#0b1424', border: '1px solid #1f2a44', padding: 6, borderRadius: 6 }}>
                   <div style={{ fontWeight: 600 }}>{h.ip}</div>
                   <div style={{ fontSize: 12, opacity: 0.85 }}>{h.name || ''}</div>
                   <div style={{ gridColumn: '1 / span 2', display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -356,7 +406,11 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
         {/* Breadcrumb header */}
         <div style={{ position: 'absolute', left: 12, top: 8, zIndex: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
           <div style={{ background: '#13203a', border: '1px solid #223154', color: '#e6edf7', padding: '6px 10px', borderRadius: 6 }}>
-            LAN Focus: {subnet}
+            {viewMode==='focus' ? `LAN Focus: ${subnet}` : `Location: ${selectedLocation || (graphSwitches[0]?.location || 'Unset')}`}
+          </div>
+          <div style={{ display: 'flex', gap: 4 }}>
+            <button type="button" onClick={()=>setViewMode('focus')} style={{ ...(viewMode==='focus'? btnPrimary : btnSecondary), padding: '4px 8px' }}>Focus</button>
+            <button type="button" onClick={()=>{ setViewMode('location'); if (!selectedLocation) { const freq = new Map<string, number>(); switches.forEach(s=>{ if (s.location) freq.set(s.location, (freq.get(s.location)||0)+1); }); let best: string | null = null; let score = 0; freq.forEach((v,k)=>{ if (v>score){ score=v; best=k; } }); setSelectedLocation(best || null); } }} style={{ ...(viewMode==='location'? btnPrimary : btnSecondary), padding: '4px 8px' }}>Location</button>
           </div>
           <button type="button" onClick={()=>{
             // Prefill location modal from most common location among visible switches
@@ -371,6 +425,13 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
           <button type="button" onClick={onClose} style={{ background: '#1d4ed8', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Close</button>
           <button type="button" onClick={()=>{ const cy = cyRef.current; if (!cy) return; try { cy.fit(cy.elements(), 50); } catch {} }} style={{ background: '#0b1424', color: '#e6edf7', border: '1px solid #1f2a44', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Fit</button>
         </div>
+        {viewMode==='location' && includedSubnets.length>1 && (
+          <div style={{ position: 'absolute', right: 12, top: 8, zIndex: 2, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {includedSubnets.map(s => (
+              <span key={s} style={{ background: subnetColor(s), color: '#0b1220', padding: '2px 6px', borderRadius: 999, fontSize: 12, border: '1px solid #223154' }}>{s}</span>
+            ))}
+          </div>
+        )}
         {/* Cytoscape instance container for LAN graph */}
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
 
@@ -379,6 +440,28 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
           <div style={{ position: 'absolute', left: Math.max(8, ctx.x - 10), top: Math.max(40, ctx.y - 10), zIndex: 5, background: '#13203a', border: '1px solid #223154', borderRadius: 8, padding: 6, minWidth: 160 }}
                onClick={e=>e.stopPropagation()} onContextMenu={e=>{ e.preventDefault(); e.stopPropagation(); }}>
             <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>{ctx.label}</div>
+            <button type="button" style={menuBtn} onClick={() => {
+              try {
+                if (ctx.kind === 'switch') {
+                  setSelectedSwitchId(ctx.id);
+                  setTimeout(()=>{
+                    const el = document.getElementById(`switch-item-${ctx.id}`);
+                    el?.scrollIntoView({ block: 'nearest' });
+                  }, 0);
+                } else {
+                  setTimeout(()=>{
+                    const el = document.getElementById(`host-item-${ctx.id}`);
+                    el?.scrollIntoView({ block: 'nearest' });
+                  }, 0);
+                }
+              } finally { setCtx(null); }
+            }}>Jump to in list</button>
+            {ctx.kind === 'host' && (
+              <button type="button" style={menuBtn} onClick={() => {
+                setAssignModal({ hostId: ctx.id, switchId: selectedSwitchId || switches[0]?.id });
+                setCtx(null);
+              }}>Assign to port…</button>
+            )}
             <button type="button" style={menuBtn} onClick={async ()=>{
               try {
                 const key = `${ctx.kind}:${ctx.id}`;
@@ -434,6 +517,45 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
                     }
                   } finally { setLocationModal(null); }
                 }} style={btnPrimary}>Save</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {assignModal && (
+          <div style={{ position: 'absolute', inset: 0, zIndex: 8, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.35)' }} onClick={()=>setAssignModal(null)}>
+            <div style={{ background: '#0f1a2b', border: '1px solid #1f2a44', borderRadius: 8, padding: 12, minWidth: 360 }} onClick={e=>e.stopPropagation()}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>Assign host to port</div>
+              <div style={{ display: 'grid', gap: 8 }}>
+                <select value={assignModal.switchId || ''} onChange={e=>setAssignModal(m => m && ({ ...m, switchId: e.target.value || undefined, portId: undefined }))} style={inputStyle as any}>
+                  {switches.length===0 && <option value="">No switches</option>}
+                  {switches.map(sw => (
+                    <option key={sw.id} value={sw.id}>{sw.name || 'Switch'}</option>
+                  ))}
+                </select>
+                <select value={assignModal.portId || ''} onChange={e=>setAssignModal(m => m && ({ ...m, portId: e.target.value || undefined }))} style={inputStyle as any}>
+                  <option value="">Select port…</option>
+                  {assignPorts.map(p => (
+                    <option key={p.id} value={p.id}>#{p.idx ?? ''} {p.name || ''}</option>
+                  ))}
+                </select>
+                <select value={assignModal.vlanId || ''} onChange={e=>setAssignModal(m => m && ({ ...m, vlanId: e.target.value || undefined }))} style={inputStyle as any}>
+                  <option value="">(Optional) Set VLAN untagged…</option>
+                  {vlans.map(v => (
+                    <option key={v.id} value={v.id}>VLAN {v.vid ?? ''} {v.name || ''}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 10 }}>
+                <button type="button" onClick={()=>setAssignModal(null)} style={btnSecondary}>Cancel</button>
+                <button type="button" onClick={async ()=>{
+                  try {
+                    if (!assignModal.switchId || !assignModal.portId) return;
+                    await bindHostToPort(assignModal.hostId, assignModal.portId);
+                    if (assignModal.vlanId) { await setPortVlanBinding(assignModal.portId, assignModal.vlanId, 'access', true); }
+                    await load();
+                  } finally { setAssignModal(null); }
+                }} style={btnPrimary}>Assign</button>
               </div>
             </div>
           </div>
