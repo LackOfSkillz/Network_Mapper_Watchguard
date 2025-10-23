@@ -147,6 +147,15 @@ export async function initDb(): Promise<void> {
       text TEXT,
       PRIMARY KEY (mapId, subnet, scope, scopeId)
     );
+    -- Locations metadata (per map)
+    CREATE TABLE IF NOT EXISTS lan_locations (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      name TEXT NOT NULL,
+      address TEXT,
+      notes TEXT,
+      UNIQUE (mapId, name)
+    );
   `);
   try { db.exec('ALTER TABLE annotations2 ADD COLUMN offset REAL'); } catch {}
   try { db.exec('ALTER TABLE annotations2 ADD COLUMN edgeNote TEXT'); } catch {}
@@ -588,3 +597,39 @@ export async function listManualHostIps(mapId: string, subnet: string): Promise<
 // Schema migrations (safe, idempotent)
 try { getDb(); } catch {}
 try { db && db.exec('ALTER TABLE lan_hosts ADD COLUMN kind TEXT'); } catch {}
+
+// ---------------- Locations ----------------
+export type LanLocation = { id: string; mapId: string; name: string; address?: string; notes?: string };
+export async function upsertLanLocation(mapId: string, name: string, address?: string, notes?: string, id?: string): Promise<string> {
+  const db = getDb();
+  const locId = id || uuid();
+  const stmt = db.prepare('INSERT INTO lan_locations (id, mapId, name, address, notes) VALUES (?, ?, ?, ?, ?) ON CONFLICT(mapId, name) DO UPDATE SET address=excluded.address, notes=excluded.notes');
+  stmt.run([locId, mapId, name, address || null, notes || null]);
+  stmt.free();
+  await touchMap(mapId);
+  return locId;
+}
+export async function listLanLocations(mapId: string): Promise<LanLocation[]> {
+  const db = getDb();
+  const out: LanLocation[] = [];
+  const stmt = db.prepare('SELECT id, mapId, name, address, notes FROM lan_locations WHERE mapId = ? ORDER BY name');
+  stmt.bind([mapId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, name: r[2] as string, address: r[3] as string | undefined, notes: r[4] as string | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function getLanLocationByName(mapId: string, name: string): Promise<LanLocation | null> {
+  const db = getDb();
+  const stmt = db.prepare('SELECT id, mapId, name, address, notes FROM lan_locations WHERE mapId = ? AND name = ?');
+  stmt.bind([mapId, name]);
+  if (!stmt.step()) { stmt.free(); return null; }
+  const r = stmt.get(); stmt.free();
+  return { id: r[0] as string, mapId: r[1] as string, name: r[2] as string, address: r[3] as string | undefined, notes: r[4] as string | undefined };
+}
+export async function setSwitchLocation(mapId: string, switchId: string, locationName: string | null): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('UPDATE lan_switches SET location = ? WHERE id = ?');
+  stmt.run([locationName || null, switchId]);
+  stmt.free();
+  await touchMap(mapId);
+}

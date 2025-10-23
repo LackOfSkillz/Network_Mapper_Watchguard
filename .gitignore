@@ -36,3 +36,12 @@ npm-debug.log*
 yarn-*.log*
 pnpm-*.log*
 ~$*
+
+# Local databases and caches
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.sqlite-journal
+/wgmap.sqlite
+/data/*.db

@@ -6,6 +6,7 @@ import {
   listLanVlans, upsertLanVlan, deleteLanVlan,
   getPortVlans, setPortVlanBinding, clearPortVlanBinding,
   getLanNotes, setLanNote,
+  listLanLocations, upsertLanLocation, setSwitchLocation,
   type LanSwitch, type LanHost, type LanPort, type LanVlan
 } from '../db';
 import cytoscape, { Core } from 'cytoscape';
@@ -43,6 +44,8 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   const [ctx, setCtx] = React.useState<null | { x: number; y: number; kind: 'switch'|'host'; id: string; label: string }>(null);
   const [noteModal, setNoteModal] = React.useState<null | { scope: 'switch'|'host'; id: string; text: string }>(null);
   const [selected, setSelected] = React.useState<null | { kind: 'switch'|'host'; id: string }>(null);
+  const [locationModal, setLocationModal] = React.useState<null | { name: string; address?: string; applyToVisible: boolean }>(null);
+  const [locations, setLocations] = React.useState<Array<{ name: string; address?: string }>>([]);
 
   const load = React.useCallback(async () => {
     try {
@@ -58,6 +61,7 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   }, [mapId, subnet, selectedSwitchId]);
 
   React.useEffect(() => { void load(); }, [load]);
+  React.useEffect(() => { (async()=>{ try { const rows = await listLanLocations(mapId); setLocations(rows.map(r=>({ name: r.name, address: r.address }))); } catch {} })(); }, [mapId]);
 
   // Prepopulate LAN hosts from parsed list (once per overlay entry or when list changes)
   React.useEffect(() => {
@@ -354,6 +358,16 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
           <div style={{ background: '#13203a', border: '1px solid #223154', color: '#e6edf7', padding: '6px 10px', borderRadius: 6 }}>
             LAN Focus: {subnet}
           </div>
+          <button type="button" onClick={()=>{
+            // Prefill location modal from most common location among visible switches
+            const lc = (()=>{
+              const map = new Map<string, number>();
+              switches.forEach(s=>{ if (s.location) map.set(s.location, (map.get(s.location)||0)+1); });
+              let best: string | null = null; let score = 0; map.forEach((v,k)=>{ if (v>score){ score=v; best=k; } });
+              return best || '';
+            })();
+            setLocationModal({ name: lc, address: locations.find(x=>x.name===lc)?.address, applyToVisible: true });
+          }} style={btnSecondary}>Location…</button>
           <button type="button" onClick={onClose} style={{ background: '#1d4ed8', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Close</button>
           <button type="button" onClick={()=>{ const cy = cyRef.current; if (!cy) return; try { cy.fit(cy.elements(), 50); } catch {} }} style={{ background: '#0b1424', color: '#e6edf7', border: '1px solid #1f2a44', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Fit</button>
         </div>
@@ -390,6 +404,36 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
               <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 10 }}>
                 <button type="button" onClick={()=>setNoteModal(null)} style={btnSecondary}>Cancel</button>
                 <button type="button" onClick={async ()=>{ try { await setLanNote(mapId, subnet, noteModal.scope, noteModal.id, noteModal.text.trim()); } finally { setNoteModal(null); } }} style={btnPrimary}>Save</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Location modal */}
+        {locationModal && (
+          <div style={{ position: 'absolute', inset: 0, zIndex: 7, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.35)' }} onClick={()=>setLocationModal(null)}>
+            <div style={{ background: '#0f1a2b', border: '1px solid #1f2a44', borderRadius: 8, padding: 12, minWidth: 420 }} onClick={e=>e.stopPropagation()}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>Edit Location</div>
+              <div style={{ display: 'grid', gap: 8 }}>
+                <input value={locationModal.name} onChange={e=>setLocationModal(m=>m && { ...m, name: e.target.value })} placeholder="Location name (e.g., System Control)" style={inputStyle} />
+                <textarea value={locationModal.address||''} onChange={e=>setLocationModal(m=>m && { ...m, address: e.target.value })} placeholder="Address (optional)" style={{ ...inputStyle, height: 90 }} />
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                  <input type="checkbox" checked={locationModal.applyToVisible} onChange={e=>setLocationModal(m=>m && { ...m, applyToVisible: e.target.checked })} />
+                  Apply this location to switches in this overlay
+                </label>
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 10 }}>
+                <button type="button" onClick={()=>setLocationModal(null)} style={btnSecondary}>Cancel</button>
+                <button type="button" onClick={async ()=>{
+                  try {
+                    const nm = (locationModal.name||'').trim(); if (!nm) { setLocationModal(null); return; }
+                    await upsertLanLocation(mapId, nm, (locationModal.address||'').trim() || undefined);
+                    if (locationModal.applyToVisible) {
+                      for (const sw of switches) { await setSwitchLocation(mapId, sw.id, nm); }
+                      await load();
+                    }
+                  } finally { setLocationModal(null); }
+                }} style={btnPrimary}>Save</button>
               </div>
             </div>
           </div>
