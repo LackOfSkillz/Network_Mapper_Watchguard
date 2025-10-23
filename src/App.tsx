@@ -872,6 +872,7 @@ export default function App() {
           <LanOverlay
             mapId={mapId}
             subnet={lanFocusSubnet}
+            knownHostIps={activeSubnet===lanFocusSubnet ? hostList : []}
             onClose={() => setLanFocusSubnet(null)}
           />
         )}

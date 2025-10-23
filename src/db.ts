@@ -130,6 +130,7 @@ export async function initDb(): Promise<void> {
       name TEXT,
       note TEXT,
       source TEXT DEFAULT 'manual',
+      kind TEXT,
       posX REAL,
       posY REAL
     );
@@ -514,21 +515,21 @@ export async function getPortVlans(portId: string): Promise<LanPortVlan[]> {
 }
 
 // ---------------- LAN: hosts ----------------
-export type LanHost = { id: string; mapId: string; subnet: string; ip?: string; mac?: string; name?: string; note?: string; source?: string; posX?: number; posY?: number };
+export type LanHost = { id: string; mapId: string; subnet: string; ip?: string; mac?: string; name?: string; note?: string; source?: string; kind?: string; posX?: number; posY?: number };
 export async function listLanHosts(mapId: string, subnet: string): Promise<LanHost[]> {
   const db = getDb();
   const out: LanHost[] = [];
-  const stmt = db.prepare('SELECT id, mapId, subnet, ip, mac, name, note, source, posX, posY FROM lan_hosts WHERE mapId = ? AND subnet = ? ORDER BY ip');
+  const stmt = db.prepare('SELECT id, mapId, subnet, ip, mac, name, note, source, kind, posX, posY FROM lan_hosts WHERE mapId = ? AND subnet = ? ORDER BY ip');
   stmt.bind([mapId, subnet]);
-  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, ip: r[3] as string | undefined, mac: r[4] as string | undefined, name: r[5] as string | undefined, note: r[6] as string | undefined, source: r[7] as string | undefined, posX: r[8] as number | undefined, posY: r[9] as number | undefined }); }
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, ip: r[3] as string | undefined, mac: r[4] as string | undefined, name: r[5] as string | undefined, note: r[6] as string | undefined, source: r[7] as string | undefined, kind: r[8] as string | undefined, posX: r[9] as number | undefined, posY: r[10] as number | undefined }); }
   stmt.free();
   return out;
 }
 export async function upsertLanHost(partial: Partial<LanHost> & { mapId: string; subnet: string }): Promise<string> {
   const db = getDb();
   const id = partial.id || (uuid());
-  const stmt = db.prepare('INSERT INTO lan_hosts (id, mapId, subnet, ip, mac, name, note, source, posX, posY) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ip=excluded.ip, mac=excluded.mac, name=excluded.name, note=excluded.note, source=excluded.source, posX=excluded.posX, posY=excluded.posY');
-  stmt.run([id, partial.mapId, partial.subnet, partial.ip || null, partial.mac || null, partial.name || null, partial.note || null, partial.source || 'manual', partial.posX ?? null, partial.posY ?? null]);
+  const stmt = db.prepare('INSERT INTO lan_hosts (id, mapId, subnet, ip, mac, name, note, source, kind, posX, posY) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ip=excluded.ip, mac=excluded.mac, name=excluded.name, note=excluded.note, source=excluded.source, kind=excluded.kind, posX=excluded.posX, posY=excluded.posY');
+  stmt.run([id, partial.mapId, partial.subnet, partial.ip || null, partial.mac || null, partial.name || null, partial.note || null, partial.source || 'manual', partial.kind || null, partial.posX ?? null, partial.posY ?? null]);
   stmt.free();
   await touchMap(partial.mapId);
   return id;
@@ -583,3 +584,7 @@ export async function listManualHostIps(mapId: string, subnet: string): Promise<
   stmt.free();
   return ips;
 }
+
+// Schema migrations (safe, idempotent)
+try { getDb(); } catch {}
+try { db && db.exec('ALTER TABLE lan_hosts ADD COLUMN kind TEXT'); } catch {}
