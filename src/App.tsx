@@ -1,6 +1,7 @@
 // src/App.tsx
 import React from 'react';
 import cytoscape, { Core } from 'cytoscape';
+import LanOverlay from './lan/LanOverlay';
 
 // Data + parsing
 import { parseWatchGuardXml, parseWatchGuardXmlText, toDomain, makeAliasUniverse, type InterfaceInfo } from './parse_watchguard';
@@ -108,8 +109,13 @@ export default function App() {
   const [editingEdge, setEditingEdge] = React.useState<{ cidr: string; value: string } | null>(null);
   const [editingNode, setEditingNode] = React.useState<{ cidr: string; value: string } | null>(null);
   const [firewalls, setFirewalls] = React.useState<Array<{ id: string; name: string; domain: Domain; xmlText?: string }>>([]);
+  const [lanFocusSubnet, setLanFocusSubnet] = React.useState<string | null>(null);
   const mapIdRef = React.useRef<string | null>(null);
   React.useEffect(() => { mapIdRef.current = mapId; }, [mapId]);
+  // Reduced motion
+  const prefersReducedMotion = React.useMemo(() => {
+    try { return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch { return false; }
+  }, []);
 
   // Cytoscape
   const cyContainerRef = React.useRef<HTMLDivElement | null>(null);
@@ -450,8 +456,9 @@ export default function App() {
 
     // Remove previous handlers to avoid duplicates
     cy.off('tap', 'node');
-    cy.off('tap', 'edge');
+  cy.off('tap', 'edge');
     cy.off('cxttap', 'node');
+  cy.off('dbltap', 'node');
     cy.on('tap', 'node', (evt) => {
       const id: string = evt.target.id();
       // firewall nodes are ids in fwIds; network nodes are keyed by cidr strings
@@ -459,6 +466,13 @@ export default function App() {
       const cidr = id; // node ids for networks are cidrs
       setActiveSubnet(prev => (prev === cidr ? null : cidr));
       setActiveHost(null);
+    });
+
+    // Double-click to enter LAN Focus overlay
+    cy.on('dbltap', 'node', (evt) => {
+      const id: string = evt.target.id();
+      if (fwIds.includes(id)) return;
+      setLanFocusSubnet(id);
     });
 
     // Edge click -> open inline editor modal
@@ -828,10 +842,28 @@ export default function App() {
           {/* <input type="file" accept=".xls,.xlsx" ref={xlsInputRef} onChange={onPickXls} style={{ display: 'none' }} /> */}
         </div>
 
-        <div ref={cyContainerRef} style={{ position: 'absolute', zIndex: 1, top: headerHeight, left: 0, right: 0, bottom: 0 }} />
+        <div
+          ref={cyContainerRef}
+          style={{
+            position: 'absolute', zIndex: 1, top: headerHeight, left: 0, right: 0, bottom: 0,
+            transformOrigin: 'top left',
+            transition: prefersReducedMotion ? 'none' : 'transform 240ms ease',
+            transform: lanFocusSubnet ? 'scale(0.25)' : 'none',
+            pointerEvents: lanFocusSubnet ? 'none' : 'auto',
+            filter: lanFocusSubnet ? 'grayscale(0.2)' : 'none',
+          }}
+        />
+
+        {/* LAN Focus overlay */}
+        {lanFocusSubnet && (
+          <LanOverlay
+            subnet={lanFocusSubnet}
+            onClose={() => setLanFocusSubnet(null)}
+          />
+        )}
 
         {/* Edge text editor modal */}
-        {editingEdge && (
+        {!lanFocusSubnet && editingEdge && (
           <div style={{ position: 'absolute', inset: 0, zIndex: 3, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.35)' }} onClick={()=>{ setEditingEdge(null); try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch {} }}>
             <div style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: 12, minWidth: 360 }} onClick={(e)=>e.stopPropagation()}>
               <div style={{ fontWeight: 600, marginBottom: 8 }}>Edit link label</div>
@@ -874,7 +906,7 @@ export default function App() {
         )}
 
         {/* Node name editor modal */}
-        {editingNode && (
+        {!lanFocusSubnet && editingNode && (
           <div style={{ position: 'absolute', inset: 0, zIndex: 3, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.35)' }} onClick={()=>{ setEditingNode(null); try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch {} }}>
             <div style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: 12, minWidth: 360 }} onClick={(e)=>e.stopPropagation()}>
               <div style={{ fontWeight: 600, marginBottom: 8 }}>Edit network name</div>
