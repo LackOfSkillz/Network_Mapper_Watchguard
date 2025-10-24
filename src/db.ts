@@ -158,15 +158,78 @@ export async function initDb(): Promise<void> {
       notes TEXT,
       UNIQUE (mapId, name)
     );
+    -- Manual modeling (from-scratch design) minimal schema
+    CREATE TABLE IF NOT EXISTS manual_devices (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      type TEXT NOT NULL, -- firewall|router|switch|ap
+      name TEXT NOT NULL,
+      mgmtIp TEXT,
+      model TEXT,
+      posX REAL,
+      posY REAL,
+      notes TEXT
+    );
+    CREATE TABLE IF NOT EXISTS manual_networks (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      cidr TEXT NOT NULL,
+      name TEXT,
+      notes TEXT,
+      posX REAL,
+      posY REAL,
+      UNIQUE (mapId, cidr)
+    );
+    CREATE TABLE IF NOT EXISTS manual_links (
+      id TEXT PRIMARY KEY,
+      mapId TEXT NOT NULL,
+      srcType TEXT NOT NULL, -- device|network
+      srcId TEXT NOT NULL,
+      dstType TEXT NOT NULL, -- device|network
+      dstId TEXT NOT NULL,
+      label TEXT,
+      UNIQUE (mapId, srcId, dstId)
+    );
   `);
-  try { db.exec('ALTER TABLE annotations2 ADD COLUMN offset REAL'); } catch {}
-  try { db.exec('ALTER TABLE annotations2 ADD COLUMN edgeNote TEXT'); } catch {}
+  // --- Migrations (run every init; safe to ignore if already applied) ---
+  try { db.exec('ALTER TABLE annotations2 ADD COLUMN offset REAL'); console.log('[DB] migration: annotations2.offset added (or already present)'); } catch (e:any) { /* duplicate ok */ }
+  try { db.exec('ALTER TABLE annotations2 ADD COLUMN edgeNote TEXT'); console.log('[DB] migration: annotations2.edgeNote added (or already present)'); } catch (e:any) { /* duplicate ok */ }
+  try { db.exec('ALTER TABLE lan_hosts ADD COLUMN kind TEXT'); console.log('[DB] migration: lan_hosts.kind added (or already present)'); } catch (e:any) { /* duplicate ok */ }
+  try { db.exec('ALTER TABLE lan_switches ADD COLUMN managed INTEGER'); console.log('[DB] migration: lan_switches.managed added (or already present)'); } catch (e:any) { /* duplicate ok */ }
+  try { db.exec('ALTER TABLE lan_switches ADD COLUMN portCount INTEGER'); console.log('[DB] migration: lan_switches.portCount added (or already present)'); } catch (e:any) { /* duplicate ok */ }
   await persist();
 }
+
+// Lightweight guard to ensure the DB is initialized before use
+export function isDbReady(): boolean { return !!db; }
+export async function ensureDbReady(): Promise<void> { if (!db) { await initDb(); } }
 
 export function getDb(): Database {
   if (!db) throw new Error('DB not initialized. Call initDb() first.');
   return db;
+}
+
+// -------- DB snapshot/restore (for undo) --------
+export async function exportDbBytes(): Promise<Uint8Array> {
+  const d = getDb();
+  const bytes = d.export();
+  return bytes;
+}
+
+export async function restoreDbBytes(bytes: Uint8Array): Promise<void> {
+  const SQL = await loadSql();
+  // Replace in-memory DB
+  db = new SQL.Database(bytes);
+  // Persist to IndexedDB immediately
+  await idbSet(DB_KEY, bytes);
+  // Re-run migrations defensively (idempotent)
+  try { db.exec('ALTER TABLE annotations2 ADD COLUMN offset REAL'); } catch {}
+  try { db.exec('ALTER TABLE annotations2 ADD COLUMN edgeNote TEXT'); } catch {}
+  try { db.exec('ALTER TABLE lan_hosts ADD COLUMN kind TEXT'); } catch {}
+  try { db.exec('ALTER TABLE lan_switches ADD COLUMN managed INTEGER'); } catch {}
+  try { db.exec('ALTER TABLE lan_switches ADD COLUMN portCount INTEGER'); } catch {}
+  // Ensure persisted snapshot matches current in-memory schema
+  await persist();
 }
 
 export async function listMaps(): Promise<MapRow[]> {
@@ -201,6 +264,19 @@ export async function createMap(name: string, xmlName: string | undefined, xmlTe
   return id;
 }
 
+// Create a map without any XML (manual modeling)
+export async function createEmptyMap(name: string): Promise<string> {
+  const db = getDb();
+  const id = uuid();
+  const now = Date.now();
+  let stmt = db.prepare('INSERT INTO maps (id, name, xmlName, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)');
+  stmt.run([id, name, null, now, now]);
+  stmt.free();
+  // No row in map_xml required; keep absent to signify manual map
+  await persist();
+  return id;
+}
+
 export async function getMapXmlText(id: string): Promise<{ xmlText: string, name: string, xmlName?: string } | null> {
   const db = getDb();
   let stmt = db.prepare('SELECT name, xmlName FROM maps WHERE id = ?');
@@ -210,13 +286,18 @@ export async function getMapXmlText(id: string): Promise<{ xmlText: string, name
   stmt.free();
   const name = row1[0] as string;
   const xmlName = row1[1] as string | undefined;
-  stmt = db.prepare('SELECT xml FROM map_xml WHERE id = ?');
-  stmt.bind([id]);
-  if (!stmt.step()) { stmt.free(); return null; }
-  const row2 = stmt.get();
-  stmt.free();
-  const xmlText = row2[0] as string;
-  return { xmlText, name, xmlName };
+  // Map may be manual (no XML row)
+  try {
+    stmt = db.prepare('SELECT xml FROM map_xml WHERE id = ?');
+    stmt.bind([id]);
+    if (!stmt.step()) { stmt.free(); return { xmlText: '', name, xmlName }; }
+    const row2 = stmt.get();
+    stmt.free();
+    const xmlText = row2[0] as string;
+    return { xmlText, name, xmlName };
+  } catch {
+    return { xmlText: '', name, xmlName };
+  }
 }
 
 export async function touchMap(id: string): Promise<void> {
@@ -405,6 +486,13 @@ export async function deleteMap(id: string): Promise<void> {
     stmt = db.prepare('DELETE FROM maps WHERE id = ?');
     stmt.run([id]);
     stmt.free();
+    // Manual modeling tables
+    stmt = db.prepare('DELETE FROM manual_links WHERE mapId = ?');
+    stmt.run([id]); stmt.free();
+    stmt = db.prepare('DELETE FROM manual_networks WHERE mapId = ?');
+    stmt.run([id]); stmt.free();
+    stmt = db.prepare('DELETE FROM manual_devices WHERE mapId = ?');
+    stmt.run([id]); stmt.free();
   } finally {
     await persist();
   }
@@ -492,6 +580,19 @@ export async function listLanVlans(mapId: string, subnet: string): Promise<LanVl
   const stmt = db.prepare('SELECT id, mapId, subnet, vid, name, meta FROM lan_vlans WHERE mapId = ? AND subnet = ? ORDER BY vid');
   stmt.bind([mapId, subnet]);
   while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, vid: r[3] as number | undefined, name: r[4] as string | undefined, meta: r[5] as string | undefined }); }
+  stmt.free();
+  return out;
+}
+// List all VLANs for a map (any subnet)
+export async function listAllLanVlans(mapId: string): Promise<LanVlan[]> {
+  const db = getDb();
+  const out: LanVlan[] = [];
+  const stmt = db.prepare('SELECT id, mapId, subnet, vid, name, meta FROM lan_vlans WHERE mapId = ? ORDER BY subnet, vid');
+  stmt.bind([mapId]);
+  while (stmt.step()) {
+    const r = stmt.get();
+    out.push({ id: r[0] as string, mapId: r[1] as string, subnet: r[2] as string, vid: r[3] as number | undefined, name: r[4] as string | undefined, meta: r[5] as string | undefined });
+  }
   stmt.free();
   return out;
 }
@@ -585,6 +686,27 @@ export async function unbindHostFromPort(hostId: string, portId: string): Promis
   stmt.run([hostId, portId]); stmt.free();
 }
 
+// Return bindings with the switch id (via ports), scoped to a map
+export type LanBindingInfo = { hostId: string; portId: string; switchId: string };
+export async function listBindingsForMap(mapId: string): Promise<LanBindingInfo[]> {
+  const db = getDb();
+  const out: LanBindingInfo[] = [];
+  const stmt = db.prepare(`
+    SELECT lb.hostId, lb.portId, lp.switchId
+    FROM lan_bindings lb
+    JOIN lan_ports lp ON lb.portId = lp.id
+    JOIN lan_switches ls ON lp.switchId = ls.id
+    WHERE ls.mapId = ?
+  `);
+  stmt.bind([mapId]);
+  while (stmt.step()) {
+    const r = stmt.get();
+    out.push({ hostId: r[0] as string, portId: r[1] as string, switchId: r[2] as string });
+  }
+  stmt.free();
+  return out;
+}
+
 // ---------------- LAN: notes ----------------
 export async function setLanNote(mapId: string, subnet: string, scope: 'lan'|'switch'|'port'|'host', scopeId: string | null, text: string): Promise<void> {
   const db = getDb();
@@ -648,10 +770,94 @@ export async function getLanLocationByName(mapId: string, name: string): Promise
   const r = stmt.get(); stmt.free();
   return { id: r[0] as string, mapId: r[1] as string, name: r[2] as string, address: r[3] as string | undefined, notes: r[4] as string | undefined };
 }
+
 export async function setSwitchLocation(mapId: string, switchId: string, locationName: string | null): Promise<void> {
   const db = getDb();
   const stmt = db.prepare('UPDATE lan_switches SET location = ? WHERE id = ?');
   stmt.run([locationName || null, switchId]);
   stmt.free();
+  await touchMap(mapId);
+}
+
+// ---------------- Manual modeling: CRUD ----------------
+export type ManualDevice = { id: string; mapId: string; type: 'firewall'|'router'|'switch'|'ap'; name: string; mgmtIp?: string; model?: string; posX?: number; posY?: number; notes?: string };
+export async function listManualDevices(mapId: string): Promise<ManualDevice[]> {
+  const db = getDb();
+  const out: ManualDevice[] = [];
+  const stmt = db.prepare('SELECT id, mapId, type, name, mgmtIp, model, posX, posY, notes FROM manual_devices WHERE mapId = ? ORDER BY name');
+  stmt.bind([mapId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, type: r[2] as any, name: r[3] as string, mgmtIp: r[4] as string | undefined, model: r[5] as string | undefined, posX: r[6] as number | undefined, posY: r[7] as number | undefined, notes: r[8] as string | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function upsertManualDevice(partial: Partial<ManualDevice> & { mapId: string; type: ManualDevice['type']; name: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || uuid();
+  const stmt = db.prepare('INSERT INTO manual_devices (id, mapId, type, name, mgmtIp, model, posX, posY, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET type=excluded.type, name=excluded.name, mgmtIp=excluded.mgmtIp, model=excluded.model, posX=excluded.posX, posY=excluded.posY, notes=excluded.notes');
+  stmt.run([id, partial.mapId, partial.type, partial.name, partial.mgmtIp || null, partial.model || null, partial.posX ?? null, partial.posY ?? null, partial.notes || null]);
+  stmt.free();
+  await touchMap(partial.mapId);
+  return id;
+}
+export async function deleteManualDevice(mapId: string, id: string): Promise<void> {
+  const db = getDb();
+  let stmt = db.prepare('DELETE FROM manual_links WHERE (srcType="device" AND srcId = ?) OR (dstType="device" AND dstId = ?)');
+  stmt.run([id, id]); stmt.free();
+  stmt = db.prepare('DELETE FROM manual_devices WHERE id = ?');
+  stmt.run([id]); stmt.free();
+  await touchMap(mapId);
+}
+
+export type ManualNetwork = { id: string; mapId: string; cidr: string; name?: string; notes?: string; posX?: number; posY?: number };
+export async function listManualNetworks(mapId: string): Promise<ManualNetwork[]> {
+  const db = getDb();
+  const out: ManualNetwork[] = [];
+  const stmt = db.prepare('SELECT id, mapId, cidr, name, notes, posX, posY FROM manual_networks WHERE mapId = ? ORDER BY cidr');
+  stmt.bind([mapId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, cidr: r[2] as string, name: r[3] as string | undefined, notes: r[4] as string | undefined, posX: r[5] as number | undefined, posY: r[6] as number | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function upsertManualNetwork(partial: Partial<ManualNetwork> & { mapId: string; cidr: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || uuid();
+  const stmt = db.prepare('INSERT INTO manual_networks (id, mapId, cidr, name, notes, posX, posY) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET cidr=excluded.cidr, name=excluded.name, notes=excluded.notes, posX=excluded.posX, posY=excluded.posY');
+  stmt.run([id, partial.mapId, partial.cidr, partial.name || null, partial.notes || null, partial.posX ?? null, partial.posY ?? null]);
+  stmt.free();
+  await touchMap(partial.mapId);
+  return id;
+}
+export async function deleteManualNetwork(mapId: string, id: string): Promise<void> {
+  const db = getDb();
+  let stmt = db.prepare('DELETE FROM manual_links WHERE (srcType="network" AND srcId = ?) OR (dstType="network" AND dstId = ?)');
+  stmt.run([id, id]); stmt.free();
+  stmt = db.prepare('DELETE FROM manual_networks WHERE id = ?');
+  stmt.run([id]); stmt.free();
+  await touchMap(mapId);
+}
+
+export type ManualLink = { id: string; mapId: string; srcType: 'device'|'network'; srcId: string; dstType: 'device'|'network'; dstId: string; label?: string };
+export async function listManualLinks(mapId: string): Promise<ManualLink[]> {
+  const db = getDb();
+  const out: ManualLink[] = [];
+  const stmt = db.prepare('SELECT id, mapId, srcType, srcId, dstType, dstId, label FROM manual_links WHERE mapId = ?');
+  stmt.bind([mapId]);
+  while (stmt.step()) { const r = stmt.get(); out.push({ id: r[0] as string, mapId: r[1] as string, srcType: r[2] as any, srcId: r[3] as string, dstType: r[4] as any, dstId: r[5] as string, label: r[6] as string | undefined }); }
+  stmt.free();
+  return out;
+}
+export async function upsertManualLink(partial: Partial<ManualLink> & { mapId: string; srcType: ManualLink['srcType']; srcId: string; dstType: ManualLink['dstType']; dstId: string }): Promise<string> {
+  const db = getDb();
+  const id = partial.id || uuid();
+  const stmt = db.prepare('INSERT INTO manual_links (id, mapId, srcType, srcId, dstType, dstId, label) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET srcType=excluded.srcType, srcId=excluded.srcId, dstType=excluded.dstType, dstId=excluded.dstId, label=excluded.label');
+  stmt.run([id, partial.mapId, partial.srcType, partial.srcId, partial.dstType, partial.dstId, partial.label || null]);
+  stmt.free();
+  await touchMap(partial.mapId);
+  return id;
+}
+export async function deleteManualLink(mapId: string, id: string): Promise<void> {
+  const db = getDb();
+  const stmt = db.prepare('DELETE FROM manual_links WHERE id = ?');
+  stmt.run([id]); stmt.free();
   await touchMap(mapId);
 }

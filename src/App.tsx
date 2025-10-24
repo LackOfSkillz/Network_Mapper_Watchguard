@@ -2,13 +2,14 @@
 import React from 'react';
 import cytoscape, { Core } from 'cytoscape';
 import LanOverlay from './lan/LanOverlay';
+import ImportPreview from './import/ImportPreview';
 
 // Data + parsing
 import { parseWatchGuardXml, parseWatchGuardXmlText, toDomain, makeAliasUniverse, type InterfaceInfo } from './parse_watchguard';
 import { xmlPoliciesToUnified, type UnifiedPolicy } from './xml_to_upolicy';
 import { mergePolicies } from './merge_policies';
 import {
-  initDb, listMaps, createMap, getMapXmlText, touchMap,
+  initDb, listMaps, createMap, createEmptyMap, getMapXmlText, touchMap,
   getAnnotationMapFor, setAnnotationFor,
   updateMapName, saveMapXml,
   getAnnotationOffsetsFor, setAnnotationOffsetFor,
@@ -16,6 +17,9 @@ import {
   addMapDevice, listMapDevices, getMapAllXmlTexts,
   deleteMap, renameFirstDeviceForMap,
   listManualHostIps,
+  listManualDevices, listManualNetworks, listManualLinks,
+  upsertManualDevice, upsertManualNetwork, upsertManualLink,
+  deleteManualDevice, deleteManualNetwork,
   type MapRow
 } from './db';
 
@@ -111,6 +115,28 @@ export default function App() {
   const [editingNode, setEditingNode] = React.useState<{ cidr: string; value: string } | null>(null);
   const [firewalls, setFirewalls] = React.useState<Array<{ id: string; name: string; domain: Domain; xmlText?: string }>>([]);
   const [lanFocusSubnet, setLanFocusSubnet] = React.useState<string | null>(null);
+  const [showImportPreview, setShowImportPreview] = React.useState(false);
+  const [undoSnapshot, setUndoSnapshot] = React.useState<Uint8Array | null>(null);
+  const [undoLabel, setUndoLabel] = React.useState<string | null>(null);
+  // Manual modeling state
+  const [manualDevices, setManualDevices] = React.useState<Array<{ id: string; name: string; type: 'firewall'|'router'|'switch'|'ap' }>>([]);
+  const [manualNetworks, setManualNetworks] = React.useState<Array<{ id: string; cidr: string; name?: string }>>([]);
+  const [manualLinks, setManualLinks] = React.useState<Array<{ id: string; srcType: 'device'|'network'; srcId: string; dstType: 'device'|'network'; dstId: string; label?: string }>>([]);
+  const [manualAdd, setManualAdd] = React.useState<{ devName: string; devType: 'firewall'|'router'|'switch'|'ap'; netCidr: string; netName: string; linkDevId?: string; linkNetId?: string; linkLabel?: string }>({ devName: '', devType: 'firewall', netCidr: '', netName: '' });
+  // Compute allowed CIDRs for current map (all interface networks across loaded firewalls)
+  const allowedCidrs = React.useMemo(() => {
+    const set = new Set<string>();
+    const domains = firewalls.map(f => f.domain);
+    for (const d of domains) {
+      for (const intf of d.interfaces) {
+        for (const c of intf.cidrs) {
+          const bits = parseInt(c.split('/')[1] || '32', 10);
+          if (Number.isFinite(bits) && bits < 32) set.add(c);
+        }
+      }
+    }
+    return Array.from(set);
+  }, [firewalls]);
   const mapIdRef = React.useRef<string | null>(null);
   React.useEffect(() => { mapIdRef.current = mapId; }, [mapId]);
   // Reduced motion
@@ -194,21 +220,30 @@ export default function App() {
       const data = await getMapXmlText(id);
       if (!data) return;
       setLastXmlText(data.xmlText);
-      const raw = await parseWatchGuardXmlText(data.xmlText);
-      const domain = toDomain(raw);
-      const univ = makeAliasUniverse(raw, domain);
-      const xmlPolicies = xmlPoliciesToUnified(raw, univ);
-      setSnap(prev => { const merged = mergePolicies(xmlPolicies, []); return { ...prev, domain, xmlPolicies, policies: merged }; });
-      const all = await getMapAllXmlTexts(id);
-      const fwArr: Array<{ id: string; name: string; domain: Domain; xmlText?: string }> = [];
-      for (let i = 0; i < all.length; i++) {
-        const entry = all[i];
-        const r = await parseWatchGuardXmlText(entry.xmlText);
-        const d = toDomain(r);
-        const nm = entry.name || (i === 0 ? (data.xmlName || data.name) : `Device ${i+1}`);
-        fwArr.push({ id: `fw-${i+1}`, name: nm, domain: d, xmlText: entry.xmlText });
+      if (data.xmlText && data.xmlText.trim().length > 0) {
+        const raw = await parseWatchGuardXmlText(data.xmlText);
+        const domain = toDomain(raw);
+        const univ = makeAliasUniverse(raw, domain);
+        const xmlPolicies = xmlPoliciesToUnified(raw, univ);
+        setSnap(prev => { const merged = mergePolicies(xmlPolicies, []); return { ...prev, domain, xmlPolicies, policies: merged }; });
+        const all = await getMapAllXmlTexts(id);
+        const fwArr: Array<{ id: string; name: string; domain: Domain; xmlText?: string }> = [];
+        for (let i = 0; i < all.length; i++) {
+          const entry = all[i];
+          const r = await parseWatchGuardXmlText(entry.xmlText);
+          const d = toDomain(r);
+          const nm = entry.name || (i === 0 ? (data.xmlName || data.name) : `Device ${i+1}`);
+          fwArr.push({ id: `fw-${i+1}`, name: nm, domain: d, xmlText: entry.xmlText });
+        }
+        setFirewalls(fwArr);
+        setManualDevices([]); setManualNetworks([]); setManualLinks([]);
+      } else {
+        // Manual map (no XML)
+        setSnap({}); setFirewalls([]);
+        const devs = await listManualDevices(id); setManualDevices(devs.map(d => ({ id: d.id, name: d.name, type: d.type })));
+        const nets = await listManualNetworks(id); setManualNetworks(nets.map(n => ({ id: n.id, cidr: n.cidr, name: n.name })));
+        const links = await listManualLinks(id); setManualLinks(links);
       }
-      setFirewalls(fwArr);
       const amap = await getAnnotationMapFor(id); setAnnotations(amap);
       const offs = await getAnnotationOffsetsFor(id); setLabelOffsets(offs);
       const enotes = await getEdgeNotesFor(id); setEdgeNotes(enotes);
@@ -353,9 +388,17 @@ export default function App() {
     Array.from(uniq).forEach(cidr => {
       if (!seenCidrs.has(cidr)) out.push({ id: `derived::${cidr}`, cidr, label: `${cidr}`, derived: true, gateways: [] });
     });
+    // 3) Include manual networks for manual maps
+    if (!firewalls.length && manualNetworks.length) {
+      for (const mn of manualNetworks) {
+        if (!out.find(x => x.cidr === mn.cidr)) {
+          out.push({ id: `manual::${mn.cidr}`, cidr: mn.cidr, label: `${mn.cidr}`, gateways: [] });
+        }
+      }
+    }
     logMsg(`Derived ${out.length} network nodes for visualization.`);
     return out;
-  }, [snap.domain, firewalls, snap.policies, logMsg]);
+  }, [snap.domain, firewalls, manualNetworks, snap.policies, logMsg]);
 
   // ---------- Cytoscape rendering ----------
   React.useEffect(() => {
@@ -384,7 +427,7 @@ export default function App() {
       networksByCidr.set(s.cidr, entry);
     }
 
-    // Add firewall nodes (or single if none)
+    // Add firewall nodes (or manual devices, or single if none)
     let fwIds: string[] = [];
     if (firewalls.length > 0) {
       fwIds = firewalls.map(f => f.id);
@@ -392,8 +435,16 @@ export default function App() {
         cy.add({ group: 'nodes', data: { id: fw.id, label: fw.name || `Firewall ${i+1}` } });
       });
     } else {
-      fwIds = ['firewall'];
-      cy.add({ group: 'nodes', data: { id: 'firewall', label: 'Firebox' }, position: { x: 0, y: 0 } });
+      if (manualDevices.length) {
+        fwIds = manualDevices.filter(d => d.type==='firewall' || d.type==='router').map(d => d.id);
+        if (fwIds.length === 0 && manualDevices.length) fwIds = [manualDevices[0].id];
+        manualDevices.forEach((d, i) => {
+          cy.add({ group: 'nodes', data: { id: d.id, label: d.name || `${d.type} ${i+1}` } });
+        });
+      } else {
+        fwIds = ['device'];
+        cy.add({ group: 'nodes', data: { id: 'device', label: 'Device' }, position: { x: 0, y: 0 } });
+      }
     }
 
     // Add network nodes
@@ -409,7 +460,7 @@ export default function App() {
       cy.add({ group: 'nodes', data: { id: cidr, label: nodeLabel, cidr } });
     }
 
-    // Edges from firewalls to networks
+    // Edges from firewalls to networks (from XML)
     for (const s of wheelSubnets) {
       const src = s.firewallId || fwIds[0];
       const targetNodeId = s.cidr; // network nodes keyed by cidr
@@ -420,6 +471,18 @@ export default function App() {
       if (cy.getElementById(edgeId).nonempty()) continue; // avoid dup edges when multiple intfs list same cidr per fw
       const edge = cy.add({ group: 'edges', data: { id: edgeId, kind: 'fw-net', source: src, target: targetNodeId, label: edgeLabel, cidr: s.cidr, interfaceName: s.interfaceName ?? null, labelOffset: initOffset } });
       edge.style('text-margin-x', initOffset);
+    }
+
+    // Manual links (device <-> network)
+    if (!firewalls.length && manualLinks.length) {
+      for (const lk of manualLinks) {
+        const src = lk.srcType === 'device' ? lk.srcId : manualNetworks.find(n=>n.id===lk.srcId)?.cidr;
+        const dst = lk.dstType === 'device' ? lk.dstId : manualNetworks.find(n=>n.id===lk.dstId)?.cidr;
+        if (!src || !dst) continue;
+        const edgeId = `m:${src}->${dst}`;
+        if (cy.getElementById(edgeId).nonempty()) continue;
+        cy.add({ group: 'edges', data: { id: edgeId, source: String(src), target: String(dst), label: lk.label || '' } });
+      }
     }
 
     // Inter-firewall links on shared networks
@@ -609,21 +672,29 @@ export default function App() {
   }, [activeSubnet]);
   const onSaveMap = React.useCallback(async () => {
     try {
-      if (!lastXmlText) { window.alert('Load an XML first, then Save.'); return; }
       if (mapId) {
         const nm = window.prompt('Map name:', mapName || '');
         if (nm && nm.trim()) { await updateMapName(mapId, nm.trim()); setMapName(nm.trim()); }
-        await saveMapXml(mapId, lastXmlText);
+        if (lastXmlText && lastXmlText.trim()) {
+          await saveMapXml(mapId, lastXmlText);
+        } else {
+          await touchMap(mapId);
+        }
         const rows = await listMaps(); setMaps(rows);
+        // Clear undo snapshot on explicit save per requirements
+        setUndoSnapshot(null); setUndoLabel(null);
         logMsg(`Saved map${mapName ? ` '${mapName}'` : ''}.`);
         try { localStorage.setItem(LAST_MAP_KEY, mapId); } catch {}
       } else {
         const nm = window.prompt('Name for this map:');
         if (!nm || !nm.trim()) return;
-        const id = await createMap(nm.trim(), lastXmlName || undefined, lastXmlText);
+        const id = lastXmlText && lastXmlText.trim() ?
+          await createMap(nm.trim(), lastXmlName || undefined, lastXmlText) :
+          await createEmptyMap(nm.trim());
         setMapId(id); setMapName(nm.trim());
         try { localStorage.setItem(LAST_MAP_KEY, id); } catch {}
         const rows = await listMaps(); setMaps(rows);
+        setUndoSnapshot(null); setUndoLabel(null);
         logMsg(`Saved new map '${nm.trim()}'.`);
       }
     } catch (e) { console.error(e); }
@@ -633,16 +704,20 @@ export default function App() {
       if (!lastXmlText) { window.alert('Load an XML first, then Save As.'); return; }
       const nm = window.prompt('New map name:');
       if (!nm || !nm.trim()) return;
-      const newId = await createMap(nm.trim(), lastXmlName || undefined, lastXmlText);
+      const newId = (lastXmlText && lastXmlText.trim()) ?
+        await createMap(nm.trim(), lastXmlName || undefined, lastXmlText) :
+        await createEmptyMap(nm.trim());
       // If user renamed the main firewall in-session, persist that name on the new map's primary device
       if (firewalls[0]?.name) {
         try { await renameFirstDeviceForMap(newId, firewalls[0].name); } catch {}
       }
-      // Add additional firewalls (skip first which is included by createMap)
-      for (let i = 1; i < firewalls.length; i++) {
-        const fw = firewalls[i];
-        if (fw.xmlText) {
-          await addMapDevice(newId, fw.name, fw.xmlText);
+      // If XML-based, add additional firewalls (skip first which is included by createMap)
+      if (lastXmlText && lastXmlText.trim()) {
+        for (let i = 1; i < firewalls.length; i++) {
+          const fw = firewalls[i];
+          if (fw.xmlText) {
+            await addMapDevice(newId, fw.name, fw.xmlText);
+          }
         }
       }
       // Copy annotations and edge data
@@ -659,6 +734,7 @@ export default function App() {
       setMapId(newId); setMapName(nm.trim());
       try { localStorage.setItem(LAST_MAP_KEY, newId); } catch {}
       const rows = await listMaps(); setMaps(rows);
+      setUndoSnapshot(null); setUndoLabel(null);
       logMsg(`Saved new map '${nm.trim()}' with ${firewalls.length} devices.`);
     } catch (e) { console.error(e); }
   }, [lastXmlText, lastXmlName, firewalls, annotations, labelOffsets, edgeNotes]);
@@ -698,6 +774,7 @@ export default function App() {
       setSnap({}); setLastXmlText(null); setLastXmlName(null);
       const rows = await listMaps(); setMaps(rows);
       try { localStorage.removeItem(LAST_MAP_KEY); } catch {}
+      setUndoSnapshot(null); setUndoLabel(null);
       logMsg(`Deleted current map '${mapName}'.`);
     } catch (e) { console.error(e); }
   }, [mapId, mapName, logMsg]);
@@ -710,6 +787,7 @@ export default function App() {
       setFirewalls([]);
       setSnap({}); setLastXmlText(null); setLastXmlName(null);
       try { localStorage.removeItem(LAST_MAP_KEY); } catch {}
+      setUndoSnapshot(null); setUndoLabel(null);
       logMsg('Closed current map.');
     } catch (e) { console.error(e); }
   }, [logMsg]);
@@ -737,6 +815,10 @@ export default function App() {
                 <button type="button" onClick={() => { const nm = window.prompt('Name for new map:'); if (nm) { setPendingCreateName(nm); xmlInputRef.current?.click(); closeAllMenus(); } }}
                   style={{ width: '100%', background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 8px', borderRadius: 6, marginBottom: 8, cursor: 'pointer' }}>
                   New map from XML…
+                </button>
+                <button type="button" onClick={async () => { const nm = window.prompt('Name for new blank (manual) map:'); if (!nm) return; const id = await createEmptyMap(nm.trim()); await loadMapById(id); closeAllMenus(); }}
+                  style={{ width: '100%', background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 8px', borderRadius: 6, marginBottom: 8, cursor: 'pointer' }}>
+                  New blank manual map
                 </button>
                 <div style={{ display: 'grid', gap: 6, marginBottom: 8 }}>
                   <button type="button" onClick={() => { const nm = window.prompt('Rename map to:', mapName || ''); if (nm && mapId) { updateMapName(mapId, nm.trim()).then(()=>{ setMapName(nm.trim()); listMaps().then(setMaps); closeAllMenus(); }); } }}
@@ -798,6 +880,7 @@ export default function App() {
                   <button type="button" onClick={()=>{ closeAllMenus(); xmlInputRef.current?.click(); }} style={{ background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 8px', borderRadius: 6, cursor: 'pointer' }}>Load XML…</button>
                   <button type="button" onClick={()=>{ closeAllMenus(); clickAddFirewallPicker(); }} style={{ background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 8px', borderRadius: 6, cursor: 'pointer' }}>Add Firewall XML…</button>
                   <button type="button" onClick={()=>{ closeAllMenus(); onRenameMainFirewall(); }} style={{ background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 8px', borderRadius: 6, cursor: 'pointer' }}>Rename Firewall…</button>
+                  <button type="button" onClick={()=>{ closeAllMenus(); if (!mapId) { window.alert('Open or save a map first to import into.'); return; } setShowImportPreview(true); }} style={{ background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 8px', borderRadius: 6, cursor: 'pointer' }}>Import from Excel (Preview)…</button>
                 </div>
               </div>
             )}
@@ -832,6 +915,23 @@ export default function App() {
           <button type="button" onClick={onSaveMap} style={{ marginLeft: 8, background: theme.button, color: 'white', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>
             Save
           </button>
+          {undoSnapshot && (
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  const { restoreDbBytes, listMaps } = await import('./db');
+                  await restoreDbBytes(undoSnapshot);
+                  const rows = await listMaps(); setMaps(rows);
+                  logMsg(`Undo applied${undoLabel ? `: ${undoLabel}` : ''}.`);
+                } catch (e) { console.error(e); }
+              }}
+              title={undoLabel ? `Undo: ${undoLabel}` : 'Undo last import'}
+              style={{ background: '#7f1d1d', color: 'white', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}
+            >
+              Undo Import
+            </button>
+          )}
           {mapId && (
             <button type="button" onClick={onCloseCurrentMap} style={{ background: theme.bg, color: theme.text, border: `1px solid ${theme.border}`, padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>
               Close Map
@@ -874,6 +974,22 @@ export default function App() {
             subnet={lanFocusSubnet}
             knownHostIps={activeSubnet===lanFocusSubnet ? hostList : []}
             onClose={() => setLanFocusSubnet(null)}
+          />
+        )}
+
+        {/* Import Preview Modal */}
+        {!lanFocusSubnet && showImportPreview && mapId && (
+          <ImportPreview
+            mapId={mapId}
+            onClose={()=> setShowImportPreview(false)}
+            allowedCidrs={allowedCidrs}
+            onApplied={async (payload)=>{
+              // payload: { bytes: Uint8Array; summary: string }
+              setUndoSnapshot(payload.bytes);
+              setUndoLabel(payload.summary);
+              setShowImportPreview(false);
+              logMsg(`Import applied. ${payload.summary}`);
+            }}
           />
         )}
 
@@ -972,6 +1088,45 @@ export default function App() {
           <div>Host: <span style={{ color: theme.accent }}>{activeHost ?? '—'}</span></div>
           {error && <div style={{ marginTop: 6, color: '#fca5a5' }}>{error}</div>}
         </div>
+
+        {/* Manual Builder (visible for manual maps without XML) */}
+        {(!lastXmlText || !lastXmlText.trim()) && mapId && (
+          <div style={{ padding: 10, borderBottom: `1px solid ${theme.border}`, overflow: 'auto', background: theme.panelBg }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Manual Builder</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
+              <div style={{ display: 'grid', gap: 6, background: theme.bg, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}` }}>
+                <div style={{ fontWeight: 600 }}>Add Device</div>
+                <input value={manualAdd.devName} onChange={e=>setManualAdd(m=>({ ...m, devName: e.target.value }))} placeholder="Device name (e.g., Firewall)" style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }} />
+                <select value={manualAdd.devType} onChange={e=>setManualAdd(m=>({ ...m, devType: e.target.value as any }))} style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }}>
+                  <option value="firewall">Firewall</option>
+                  <option value="router">Router</option>
+                  <option value="switch">Switch</option>
+                  <option value="ap">AP</option>
+                </select>
+                <button type="button" onClick={async ()=>{ const nm = manualAdd.devName.trim(); if (!nm || !mapId) return; const id = await upsertManualDevice({ mapId, type: manualAdd.devType, name: nm }); setManualDevices(await listManualDevices(mapId).then(ds=>ds.map(d=>({ id: d.id, name: d.name, type: d.type })))); setManualAdd(m=>({ ...m, devName: '' })); }} style={{ background: theme.button, color: 'white', border: 'none', padding: '6px 10px', borderRadius: 6 }}>Add Device</button>
+              </div>
+              <div style={{ display: 'grid', gap: 6, background: theme.bg, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}` }}>
+                <div style={{ fontWeight: 600 }}>Add Network</div>
+                <input value={manualAdd.netCidr} onChange={e=>setManualAdd(m=>({ ...m, netCidr: e.target.value }))} placeholder="CIDR (e.g., 10.102.92.0/24)" style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }} />
+                <input value={manualAdd.netName} onChange={e=>setManualAdd(m=>({ ...m, netName: e.target.value }))} placeholder="Name (optional)" style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }} />
+                <button type="button" onClick={async ()=>{ const c = manualAdd.netCidr.trim(); if (!c || !mapId) return; await upsertManualNetwork({ mapId, cidr: c, name: manualAdd.netName.trim() || undefined }); setManualNetworks(await listManualNetworks(mapId).then(ns=>ns.map(n=>({ id: n.id, cidr: n.cidr, name: n.name })))); setManualAdd(m=>({ ...m, netCidr: '', netName: '' })); }} style={{ background: theme.button, color: 'white', border: 'none', padding: '6px 10px', borderRadius: 6 }}>Add Network</button>
+              </div>
+              <div style={{ display: 'grid', gap: 6, background: theme.bg, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}` }}>
+                <div style={{ fontWeight: 600 }}>Link Device ↔ Network</div>
+                <select value={manualAdd.linkDevId || ''} onChange={e=>setManualAdd(m=>({ ...m, linkDevId: e.target.value || undefined }))} style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }}>
+                  <option value="">Select device…</option>
+                  {manualDevices.map(d => (<option key={d.id} value={d.id}>{d.name}</option>))}
+                </select>
+                <select value={manualAdd.linkNetId || ''} onChange={e=>setManualAdd(m=>({ ...m, linkNetId: e.target.value || undefined }))} style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }}>
+                  <option value="">Select network…</option>
+                  {manualNetworks.map(n => (<option key={n.id} value={n.id}>{n.cidr}</option>))}
+                </select>
+                <input value={manualAdd.linkLabel || ''} onChange={e=>setManualAdd(m=>({ ...m, linkLabel: e.target.value }))} placeholder="Link label (e.g., IF 0/4 | VLAN 10)" style={{ background: theme.panelBg, border: `1px solid ${theme.border}`, color: theme.text, padding: '6px 8px', borderRadius: 6 }} />
+                <button type="button" onClick={async ()=>{ if (!mapId || !manualAdd.linkDevId || !manualAdd.linkNetId) return; await upsertManualLink({ mapId, srcType: 'device', srcId: manualAdd.linkDevId, dstType: 'network', dstId: manualAdd.linkNetId, label: manualAdd.linkLabel?.trim() || undefined }); setManualLinks(await listManualLinks(mapId)); setManualAdd(m=>({ ...m, linkDevId: undefined, linkNetId: undefined, linkLabel: '' })); }} style={{ background: theme.button, color: 'white', border: 'none', padding: '6px 10px', borderRadius: 6 }}>Add Link</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Hosts (explicit /32s only) */}
         <div style={{ padding: 10, borderBottom: `1px solid ${theme.border}`, overflow: 'auto', background: theme.panelBg }}>

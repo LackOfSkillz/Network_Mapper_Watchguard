@@ -8,7 +8,8 @@ import {
   getPortVlans, setPortVlanBinding, clearPortVlanBinding,
   getLanNotes, setLanNote,
   listLanLocations, upsertLanLocation, setSwitchLocation,
-  bindHostToPort,
+  bindHostToPort, unbindHostFromPort,
+  listBindingsForMap,
   type LanSwitch, type LanHost, type LanPort, type LanVlan
 } from '../db';
 import cytoscape, { Core } from 'cytoscape';
@@ -62,6 +63,9 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   const [assignModal, setAssignModal] = React.useState<null | { hostId: string; switchId?: string; portId?: string; vlanId?: string }>(null);
   const [assignPorts, setAssignPorts] = React.useState<LanPort[]>([]);
   const leftPanelRef = React.useRef<HTMLDivElement | null>(null);
+  const [bindings, setBindings] = React.useState<Map<string, string>>(new Map()); // hostId -> switchId
+  const [hostPortMap, setHostPortMap] = React.useState<Map<string, string>>(new Map()); // hostId -> portId
+  const didAutoAssignRef = React.useRef(false);
 
   const load = React.useCallback(async () => {
     try {
@@ -79,6 +83,63 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   React.useEffect(() => { void load(); }, [load]);
   React.useEffect(() => { (async()=>{ try { const rows = await listLanLocations(mapId); setLocations(rows.map(r=>({ name: r.name, address: r.address }))); } catch {} })(); }, [mapId]);
   React.useEffect(() => { (async()=>{ try { const swAll = await listAllMapSwitches(mapId); setAllSwitches(swAll); const hsAll = await listAllLanHosts(mapId); setAllHosts(hsAll); } catch {} })(); }, [mapId]);
+  React.useEffect(() => { (async()=>{ try { const rows = await listBindingsForMap(mapId); const swMap = new Map<string, string>(); const hp = new Map<string, string>(); rows.forEach(r=> { swMap.set(r.hostId, r.switchId); hp.set(r.hostId, r.portId); }); setBindings(swMap); setHostPortMap(hp); } catch (e) { console.error(e); } })(); }, [mapId, ports.length, switches.length]);
+
+  // Auto-assign default ports (1-48 or switch.portCount) for unbound hosts so they render radially
+  React.useEffect(() => {
+    (async () => {
+      try {
+        if (viewMode !== 'focus') return; // only in subnet focus
+        if (hosts.length === 0 || switches.length === 0) return;
+        // Find hosts without a port binding
+        const unbound = hosts.filter(h => !hostPortMap.has(h.id));
+        if (unbound.length === 0) return;
+        const targetSwitchId = selectedSwitchId || switches[0]?.id;
+        if (!targetSwitchId) return;
+
+        // Ensure default ports exist
+        const sw = switches.find(s => s.id === targetSwitchId)!;
+        const desiredCount = (sw.portCount && sw.portCount > 0) ? sw.portCount : 48;
+        let existing = await listLanPorts(targetSwitchId);
+        const haveIdx = new Set(existing.map(p => p.idx).filter((n): n is number => typeof n === 'number'));
+        for (let i = 1; i <= desiredCount; i++) {
+          if (!haveIdx.has(i)) { await upsertLanPort({ switchId: targetSwitchId, idx: i }); }
+        }
+        existing = await listLanPorts(targetSwitchId);
+        const byIdx = new Map<number, LanPort>();
+        existing.forEach(p => { if (typeof p.idx === 'number') byIdx.set(p.idx, p); });
+
+        // Get currently used portIds for this switch
+        const allBinds = await listBindingsForMap(mapId);
+        const usedPortIds = new Set<string>(allBinds.filter(b => b.switchId === targetSwitchId).map(b => b.portId));
+
+        // Assign each unbound host to next available port idx (wrap if needed)
+        let cursor = 1;
+        for (const h of unbound) {
+          // find next free idx
+          let tries = 0; let chosen: LanPort | undefined;
+          while (tries < desiredCount) {
+            const port = byIdx.get(((cursor - 1) % desiredCount) + 1);
+            cursor++;
+            tries++;
+            if (!port) continue;
+            if (!usedPortIds.has(port.id)) { chosen = port; break; }
+          }
+          // If all are used, just pick by cursor anyway
+          if (!chosen) { chosen = byIdx.get(((cursor - 2 + desiredCount) % desiredCount) + 1); }
+          if (chosen) {
+            await bindHostToPort(h.id, chosen.id);
+            usedPortIds.add(chosen.id);
+          }
+        }
+        // Refresh bindings map after assignment
+        const rows = await listBindingsForMap(mapId);
+        const swMap = new Map<string, string>(); const hp = new Map<string, string>();
+        rows.forEach(r => { swMap.set(r.hostId, r.switchId); hp.set(r.hostId, r.portId); });
+        setBindings(swMap); setHostPortMap(hp);
+      } catch (e) { console.error(e); }
+    })();
+  }, [viewMode, hosts, switches, selectedSwitchId, mapId, hostPortMap]);
   React.useEffect(() => { (async()=>{ if (!assignModal?.switchId) { setAssignPorts([]); return; } try { const p = await listLanPorts(assignModal.switchId); setAssignPorts(p); } catch {} })(); }, [assignModal?.switchId]);
 
   // Prepopulate LAN hosts from parsed list (once per overlay entry or when list changes)
@@ -138,10 +199,10 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
         container: containerRef.current,
         elements: [],
         style: [
-          { selector: 'node', style: { 'background-color': '#1b2942', 'border-color': '#3b4d75', 'border-width': 2, 'label': 'data(label)', 'color': '#e6edf7', 'font-size': 11, 'text-wrap': 'wrap', 'text-max-width': '160px' } },
+          { selector: 'node', style: { 'background-color': '#1b2942', 'border-color': '#3b4d75', 'border-width': 2, 'label': 'data(label)', 'color': '#e6edf7', 'font-size': 11, 'text-wrap': 'wrap', 'text-max-width': '160px', 'text-outline-color': '#0e1726', 'text-outline-width': 2 } },
           { selector: 'node[type = "switch"]', style: { 'shape': 'round-rectangle', 'padding': '8px 10px', 'width': 'label', 'height': 'label' } },
           { selector: 'node[type = "host"]', style: { 'shape': 'ellipse', 'width': 26, 'height': 26, 'text-valign': 'bottom', 'text-margin-y': -6 } },
-          { selector: 'edge', style: { 'width': 2, 'line-color': '#6b7daa', 'curve-style': 'bezier' } },
+          { selector: 'edge', style: { 'width': 2, 'line-color': '#93b4ff', 'curve-style': 'straight', 'target-arrow-shape': 'vee', 'target-arrow-color': '#93b4ff', 'arrow-scale': 0.9, 'opacity': 0.9 } },
           { selector: '.active', style: { 'border-color': '#4f8ef7', 'border-width': 3 } },
         ],
       });
@@ -179,9 +240,10 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
     // Rebuild elements from current switches/hosts
     cy.elements().remove();
     // Layout helpers
-    const sx = graphSwitches.length;
-    const spacingX = 200;
-    const baseY = 160;
+  const sx = graphSwitches.length;
+  const spacingX = 260;
+    const baseY = 0;
+    // 1) Add switches (centers)
     graphSwitches.forEach((sw, idx) => {
       const id = `sw:${sw.id}`;
       const label = sw.name || 'Switch';
@@ -193,19 +255,66 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
       }
       (node as any).grabbable(true);
     });
-    const hx = graphHosts.length;
-    const hostRowY = baseY + 160;
-    graphHosts.forEach((h, idx) => {
-      const id = `host:${h.id}`;
-      const label = h.name ? `${h.name}\n${h.ip || ''}` : (h.ip || 'host');
-      const node = cy.add({ group: 'nodes', data: { id, label, kind: 'host', hid: h.id, type: 'host' } });
-      if (typeof h.posX === 'number' && typeof h.posY === 'number') {
-        node.position({ x: h.posX, y: h.posY });
+    // 2) Group hosts by assigned switch
+    const bySwitch = new Map<string, LanHost[]>();
+    const unassigned: LanHost[] = [];
+    for (const h of graphHosts) {
+      const sid = bindings.get(h.id);
+      if (sid && graphSwitches.find(s=>s.id===sid)) {
+        const arr = bySwitch.get(sid) || []; arr.push(h); bySwitch.set(sid, arr);
       } else {
-        node.position({ x: (idx - (hx-1)/2) * 160, y: hostRowY });
+        unassigned.push(h);
       }
-      (node as any).grabbable(true);
-    });
+    }
+    // Helper for polar placement around a center
+    const polar = (cx:number, cy:number, r:number, i:number, n:number) => {
+      const angle0 = -Math.PI/2; // start at top
+      const angle = angle0 + (2*Math.PI * i) / Math.max(1, n);
+      return { x: cx + r*Math.cos(angle), y: cy + r*Math.sin(angle) };
+    };
+    const ringRadiusFor = (n:number) => {
+      const minR = 200;            // minimum radius
+      const minArc = 58;           // desired arc length per node to avoid overlap
+      const rBySpacing = (n * minArc) / (2*Math.PI);
+      return Math.max(minR, rBySpacing);
+    };
+    // 3) Add hosts assigned to each switch in a ring and connect edges
+    for (const sw of graphSwitches) {
+      const cid = `sw:${sw.id}`;
+      const center = cy.getElementById(cid).position();
+      const arr = bySwitch.get(sw.id) || [];
+      const n = arr.length;
+      const ringR = ringRadiusFor(Math.max(1, n));
+      arr.forEach((h, idx) => {
+        const id = `host:${h.id}`;
+        const label = h.name ? `${h.name}\n${h.ip || ''}` : (h.ip || 'host');
+        const node = cy.add({ group: 'nodes', data: { id, label, kind: 'host', hid: h.id, type: 'host' } });
+        if (typeof h.posX === 'number' && typeof h.posY === 'number') {
+          node.position({ x: h.posX, y: h.posY });
+        } else {
+          const p = polar(center.x, center.y, ringR, idx, n);
+          node.position(p);
+        }
+        (node as any).grabbable(true);
+        // Edge
+        cy.add({ group: 'edges', data: { id: `e:${sw.id}:${h.id}`, source: cid, target: id } });
+      });
+    }
+    // 4) Add unassigned hosts in a wider arc at the bottom
+    if (unassigned.length) {
+      const baseX = 0; const baseYHosts = 240;
+      unassigned.forEach((h, idx) => {
+        const id = `host:${h.id}`;
+        const label = h.name ? `${h.name}\n${h.ip || ''}` : (h.ip || 'host');
+        const node = cy.add({ group: 'nodes', data: { id, label, kind: 'host', hid: h.id, type: 'host' } });
+        if (typeof h.posX === 'number' && typeof h.posY === 'number') {
+          node.position({ x: h.posX, y: h.posY });
+        } else {
+          node.position({ x: baseX + (idx - (unassigned.length-1)/2) * 140, y: baseYHosts });
+        }
+        (node as any).grabbable(true);
+      });
+    }
     try { cy.fit(cy.elements(), 50); } catch {}
   }, [graphSwitches, graphHosts, mapId, subnet, viewMode]);
 
@@ -231,7 +340,8 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
   }, [onClose]);
 
   return (
-    <div style={{ position: 'absolute', inset: 0, zIndex: 30, display: 'grid', gridTemplateColumns: '300px 1fr' }}>
+    // Use fixed overlay so the LAN header/menu stays locked to the viewport even if the page scrolls
+    <div style={{ position: 'fixed', inset: 0, zIndex: 30, display: 'grid', gridTemplateColumns: '300px 1fr' }}>
       {/* Left LAN panel scaffold */}
   <div ref={leftPanelRef} style={{ background: '#0f1a2b', borderRight: '1px solid #1f2a44', padding: 10, overflow: 'auto' }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>LAN Panel</div>
@@ -392,6 +502,26 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
                       <option value="rtac">RTAC</option>
                       <option value="other">Other</option>
                     </select>
+                    {switches.length === 1 && (
+                      <select value={hostPortMap.get(h.id) || ''} onChange={async (e)=>{
+                        try {
+                          const currentPortId = hostPortMap.get(h.id);
+                          const newPortId = e.target.value || undefined;
+                          if (currentPortId && currentPortId !== newPortId) { await unbindHostFromPort(h.id, currentPortId); }
+                          if (newPortId) { await bindHostToPort(h.id, newPortId); }
+                          // refresh
+                          const rows = await listBindingsForMap(mapId);
+                          const swMap = new Map<string, string>(); const hp = new Map<string, string>();
+                          rows.forEach(r=>{ swMap.set(r.hostId, r.switchId); hp.set(r.hostId, r.portId); });
+                          setBindings(swMap); setHostPortMap(hp);
+                        } catch (err) { console.error(err); }
+                      }} style={inputStyle as any}>
+                        <option value="">Unassigned</option>
+                        {ports.map(p => (
+                          <option key={p.id} value={p.id}>Port #{p.idx ?? ''} {p.name || ''}</option>
+                        ))}
+                      </select>
+                    )}
                   </div>
                   <button type="button" title="Delete host" onClick={async ()=>{ await deleteLanHost(mapId, h.id); await load(); }} style={btnDanger}>Delete</button>
                 </div>
@@ -401,10 +531,11 @@ export default function LanOverlay({ mapId, subnet, onClose, knownHostIps }: Pro
         </Section>
       </div>
 
-      {/* Center LAN graph placeholder and breadcrumb */}
+  {/* Center LAN graph placeholder and breadcrumb */}
   <div ref={overlayRef} style={{ position: 'relative', background: '#0e1726' }}>
         {/* Breadcrumb header */}
-        <div style={{ position: 'absolute', left: 12, top: 8, zIndex: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+    {/* Keep header pinned within the fixed overlay; absolute is fine because overlay is fixed */}
+    <div style={{ position: 'absolute', left: 12, top: 8, zIndex: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
           <div style={{ background: '#13203a', border: '1px solid #223154', color: '#e6edf7', padding: '6px 10px', borderRadius: 6 }}>
             {viewMode==='focus' ? `LAN Focus: ${subnet}` : `Location: ${selectedLocation || (graphSwitches[0]?.location || 'Unset')}`}
           </div>
